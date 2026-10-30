@@ -35,3 +35,24 @@ Resumen con subtotal, propina, total, consumo del cumplimentado, recaudado y por
 
 - `npm test`: 15 comprobaciones de API, todas OK (bloqueos por estado, ausencia de precios/propina para el cumplimentado, matemática del reparto, disponibilidad, duplicados, cierre, PIN).
 - `python3 test/e2e.py`: recorrido completo en Chromium (viewport móvil 390×844), OK; sin errores de consola. Se revisaron capturas de `/company` y `/admin`.
+
+
+## Preparación Railway (2026-10-30)
+- `railway.json`: Railpack, comando de inicio, reinicio ante error y healthcheck.
+- `.node-version`: Node 22.
+- Servidor escucha en `0.0.0.0` (configurable mediante `HOST`) y utiliza `PORT`.
+- `GET /health`: comprueba disponibilidad del proceso y acceso a SQLite.
+- `ADMIN_PIN` obligatorio cuando `NODE_ENV=production` (fallo de arranque seguro).
+- Cierre ordenado del servidor y SQLite al recibir SIGTERM/SIGINT.
+- Documentación de volumen `/data`, variables y despliegue en Railway; `.env` excluido de Git.
+- Configuración entregada; **despliegue real en Railway no verificado**.
+
+## Documentación de cambios solicitados (2026-10-30)
+- Se agregó `REGLAS_NEGOCIO_ACTUALIZACION.md` con reglas RN-01 a RN-03, plan técnico, migración y criterios de aceptación.
+- Se actualizó `FALTANTE.md` para reflejar que los cambios de lógica **todavía no están implementados**.
+- El código de aplicación se mantiene sin cambios en esta entrega para no introducir un reparto incorrecto sin confirmar su política.
+
+
+## Aclaración de negocio (2026-10-30)
+
+Se confirmó y documentó el reparto definitivo en `REGLAS_NEGOCIO_ACTUALIZACION.md`: consumo individual + parte igual de propina manual y consumos de exentos e invitados, con redondeo a la centena superior. **Solo documentación; todavía NO implementado en el código.**
