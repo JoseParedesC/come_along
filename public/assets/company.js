@@ -1,17 +1,25 @@
-import { api, h, clear, money, pct, stepper, ticket, toast } from '/assets/common.js';
+import { api, h, clear, money, pct, stepper, ticket, toast, token, withToken } from '/assets/common.js';
 
 const root = document.getElementById('app');
+const POLL_MS = 8000;
+let pollTimer = null;
+const stopPolling = () => { clearInterval(pollTimer); pollTimer = null; };
 
 function notice(title, text, done = false) {
+  stopPolling();
   clear(root);
   root.append(h('h1', {}, title), h('div', { class: `notice${done ? ' done' : ''}` }, text));
 }
 
 async function init() {
-  const s = await api('/api/company');
+  stopPolling();
+  if (!token) return notice('Falta el enlace', 'Abre el enlace completo que te compartió el organizador.');
+  const s = await api(withToken('/api/company'));
+  if (s.status === 'invalid') return notice('Enlace no válido', 'Este enlace no existe o fue reemplazado. Pide uno nuevo al organizador.');
   if (s.status === 'none') return notice('Todavía no hay cuenta', 'El organizador aún no ha creado la cuenta.');
-  if (s.status === 'setup' || s.status === 'honoree') return notice(s.eventName, 'Aún no está habilitado. Falta que el cumplimentado registre su consumo; vuelve a abrir este enlace en unos minutos.');
+  if (s.status === 'setup' || s.status === 'honoree') return notice(s.eventName, 'Aún no está habilitado. Faltan los consumos de exentos e invitados; vuelve a abrir este enlace en unos minutos.');
   if (s.status === 'closed') return notice(s.eventName, 'El cobro ya fue cerrado. Si necesitas algo, habla con el organizador.');
+  if (s.rulesVersion === 2 && s.registered >= s.payersCount) return notice(s.eventName, 'Ya se registraron todos los participantes que pagan.');
   renderForm(s);
 }
 
@@ -21,12 +29,20 @@ function renderForm(s) {
   const saveBox = h('div');
   const quoteBtn = h('button', { type: 'button', class: 'btn grow', onClick: onQuote }, 'Ver total');
 
-  const pickers = s.items.map((it) => ({
-    it,
-    st: stepper({ max: it.available, label: it.name, onChange: invalidate }),
-  }));
+  const rows = s.items.map((it) => {
+    const st = stepper({ max: it.available, label: it.name, onChange: invalidate });
+    const price = h('div', { class: 'meta' }, `${money(it.price)} c/u`);
+    const left = h('div', { class: 'meta' });
+    const row = h('li', { class: 'item' }, h('div', {}, h('div', { class: 'name' }, it.name), price, left), st.el);
+    const paint = (avail) => {
+      left.textContent = avail > 0 ? `Quedan ${avail}` : 'Agotado';
+      row.classList.toggle('out', avail <= 0);
+    };
+    paint(it.available);
+    return { it, st, paint, row };
+  });
 
-  const selection = () => pickers.filter((p) => p.st.value > 0).map((p) => ({ itemId: p.it.id, qty: p.st.value }));
+  const selection = () => rows.filter((r) => r.st.value > 0).map((r) => ({ itemId: r.it.id, qty: r.st.value }));
 
   function invalidate() {
     if (!quoted) return;
@@ -40,7 +56,7 @@ function renderForm(s) {
     if (!sel.length) return toast('Selecciona al menos un ítem.', true);
     quoteBtn.disabled = true;
     try {
-      const { breakdown } = await api('/api/company/quote', { method: 'POST', body: { selection: sel } });
+      const { breakdown } = await api(withToken('/api/company/quote'), { method: 'POST', body: { selection: sel } });
       quoted = true;
       clear(ticketBox);
       ticketBox.append(ticket(breakdown));
@@ -62,7 +78,7 @@ function renderForm(s) {
       if (!name) return toast('Escribe tu nombre.', true);
       saveBtn.disabled = true;
       try {
-        const r = await api('/api/company/guests', { method: 'POST', body: { name, selection: selection() } });
+        const r = await api(withToken('/api/company/guests'), { method: 'POST', body: { name, selection: selection() } });
         renderSaved(r);
       } catch (err) {
         toast(err.message, true);
@@ -71,39 +87,55 @@ function renderForm(s) {
       }
     });
     clear(saveBox);
-    saveBox.append(
-      h('div', { class: 'panel save' },
-        h('div', { class: 'field' }, h('label', { for: 'guest-name' }, 'Tu nombre'), nameIn),
-        h('div', { class: 'actions' }, saveBtn))
-    );
+    saveBox.append(h('div', { class: 'panel save' },
+      h('div', { class: 'field' }, h('label', { for: 'guest-name' }, 'Tu nombre'), nameIn),
+      h('div', { class: 'actions' }, saveBtn)));
   }
 
   function renderSaved({ guest, breakdown }) {
+    stopPolling();
     clear(root);
     root.append(
       h('h1', {}, `Gracias, ${guest.name}`),
       h('div', { class: 'notice done' }, 'Tu cuenta quedó guardada. Este es el valor que debes pagar.'),
-      ticket(breakdown, { title: 'Tu cuenta guardada' })
-    );
+      ticket(breakdown, { title: 'Tu cuenta guardada' }));
   }
+
+  // Disponibilidad en vivo: otros participantes pueden tomar unidades mientras eliges.
+  async function refresh() {
+    if (document.hidden) return;
+    try {
+      const f = await api(withToken('/api/company'));
+      if (f.status !== 'open') return init();
+      let clipped = false;
+      for (const r of rows) {
+        const now = f.items.find((i) => i.id === r.it.id);
+        if (!now) continue;
+        r.it.available = now.available;
+        r.paint(now.available);
+        if (r.st.setMax(now.available)) clipped = true;
+      }
+      if (clipped) {
+        quoted = true;
+        invalidate();
+        toast('Otra persona tomó unidades: ajustamos tu selección.', true);
+      }
+    } catch { /* un fallo de red puntual no debe interrumpir la pantalla */ }
+  }
+
+  const intro = s.rulesVersion === 2
+    ? 'Tu total es tu consumo más una parte igual de la propina y del consumo de exentos e invitados, redondeado a la siguiente centena.'
+    : `Se suma la propina (${pct(s.tipPercent)}) y la parte del consumo del cumplimentado, que no paga.`;
 
   clear(root);
   root.append(
     h('h1', {}, s.eventName),
     h('p', { class: 'lead' }, 'Marca lo que consumiste y pulsa “Ver total”.'),
-    h('div', { class: 'panel' },
-      h('ul', { class: 'list' }, pickers.map(({ it, st }) =>
-        h('li', { class: `item${it.available <= 0 ? ' out' : ''}` },
-          h('div', {},
-            h('div', { class: 'name' }, it.name),
-            h('div', { class: 'meta' }, `${money(it.price)} c/u`),
-            h('div', { class: 'meta' }, it.available > 0 ? `Quedan ${it.available}` : 'Agotado')),
-          st.el)))),
-    h('p', { class: 'muted small' }, `Se suma la propina (${pct(s.tipPercent)}) y la parte del consumo del cumplimentado, que no paga.`),
+    h('div', { class: 'panel' }, h('ul', { class: 'list' }, rows.map((r) => r.row))),
+    h('p', { class: 'muted small' }, intro),
     h('div', { class: 'actions' }, quoteBtn),
-    ticketBox,
-    saveBox
-  );
+    ticketBox, saveBox);
+  pollTimer = setInterval(refresh, POLL_MS);
 }
 
 init().catch((err) => notice('No se pudo cargar', err.message));
