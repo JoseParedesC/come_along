@@ -98,7 +98,14 @@ function renderForm(s) {
     root.append(
       h('h1', {}, `Gracias, ${guest.name}`),
       h('div', { class: 'notice done' }, 'Tu cuenta quedó guardada. Este es el valor que debes pagar.'),
-      ticket(breakdown, { title: 'Tu cuenta guardada' }));
+      ticket(breakdown, { title: 'Tu cuenta guardada' }),
+      h('div', { class: 'panel', style: 'margin-top:20px' },
+        h('p', { class: 'small muted', style: 'margin:0 0 10px' }, '💳 Datos para transferencia'),
+        h('dl', { class: 'kv' },
+          h('dt', {}, 'Llave Pix / Nequi / alias'),
+          h('dd', {}, '@paredes813'),
+          h('dt', {}, 'Titular'),
+          h('dd', {}, 'Jose Paredes Caballero'))));
   }
 
   // Disponibilidad en vivo: otros participantes pueden tomar unidades mientras eliges.
