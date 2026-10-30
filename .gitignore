@@ -3,6 +3,8 @@ node_modules/
 *.db
 *.db-wal
 *.db-shm
+*.bak
+backups/
 
 .env
 .env.*

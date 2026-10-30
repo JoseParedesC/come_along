@@ -1,6 +1,6 @@
 # Actualización de reglas de negocio — Come Along
 
-Fecha: 2026-10-30. Estado: **especificación preparada; implementación pendiente**.
+Fecha: 2026-10-30. Estado: **implementado y probado** (ver `IMPLEMENTADO.md`; pruebas en `test/`).
 
 ## RN-01 — Participantes, exentos e invitados
 
@@ -55,10 +55,19 @@ Registrar por separado el importe calculado antes del redondeo, el importe cobra
 - Eventos existentes y sus registros sobreviven la migración.
 - Se mantienen las configuraciones Railway, `GET /health`, `ADMIN_PIN` y SQLite persistente.
 
-## Estado del código inspeccionado
+## Estado del código
 
-`server.js` actualmente calcula propina con `tip_percent`, `computeQuote` distribuye importes proporcionalmente al consumo y redondea al peso; `public/assets/admin.js` ofrece un campo de porcentaje. **Estas reglas nuevas no están implementadas aún**. Este documento permite continuar sin dar por hechos cambios que no se han probado.
+RN-01 a RN-04 están implementadas en `lib/split.js` (cálculo), `lib/db.js` (migración), `server.js` (API) y `public/assets/*` (UI). Cobertura: `test/unit.mjs` (ejemplo de aceptación y casos límite), `test/migration.mjs`, `test/smoke.mjs` y `test/e2e.py`.
 
+### Decisiones de implementación
+
+- **Modelo**: tablas `people` (`exempt` | `guest`) y `person_items`. El antiguo «cumplimentado» migra a una persona exenta con su consumo copiado; `honoree_items` se conserva intacta.
+- **`/cumplimentado`** atiende a exentos e invitados: cada uno elige su nombre y registra su consumo (sin ver valores ni propina). `/company` se abre cuando todos se registraron; si no hay ninguno, se abre al habilitar.
+- **Cupos**: no se aceptan más participantes que el número de pagadores. No se puede cerrar con cuotas pendientes (registrados ≠ pagadores), salvo que no haya ninguno (cancelación).
+- **Propina**: ítem con `is_tip`; no se puede consumir ni asignar a nadie y se cuenta una sola vez en los gastos compartidos.
+- **Históricos**: las cuentas anteriores quedan con `rules_version = 1`, conservan el cálculo proporcional con porcentaje y no son editables. Las nuevas usan `rules_version = 2` y `tip_percent = 0` (el campo `tipPercent` se ignora).
+- **Transparencia**: se guardan `calc_exact` (sin redondeo), `total` (cobrado) y `rounding_diff`. En el ticket, propina y parte de exentos/invitados se muestran truncadas al peso y una línea de «ajuste» absorbe fracciones y redondeo, para que las líneas sumen exactamente el total.
+- **Edición posterior**: se recalculan las cuotas guardadas; si el cambio alteraría la cuota de alguien marcado como pagado, se rechaza todo el cambio.
 ## RN-04 — Reparto definitivo confirmado (2026-10-30)
 
 - **Pagador:** paga exactamente su consumo individual más una parte IGUAL de todos los gastos compartidos.
@@ -83,4 +92,4 @@ Tres pagadores consumen 25.000, 30.000 y 20.000 COP; un exento consume 15.000, u
 - Caso de cero pagadores, propina cero y consumos cero.
 - Evitar duplicación de propina y preservar cuentas históricas durante migración.
 
-**Estado:** especificado y confirmado; implementación en backend/UI/SQLite aún pendiente.
+**Estado:** implementado y verificado con las pruebas de este repositorio (ejemplo 37.400 / 42.400 / 32.400, recaudo 112.200, diferencia 200).

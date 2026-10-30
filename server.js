@@ -1,72 +1,47 @@
 'use strict';
 /**
- * Cuenta compartida — monolito (Node 22 + SQLite embebido, sin dependencias).
+ * Come Along / Cuenta compartida — monolito (Node 22 + SQLite embebido, sin dependencias).
  *
- * Flujo:  /admin  ->  /cumplimentado  ->  /company
- * Estados del evento: setup -> honoree -> open -> closed
+ * Enlaces:   /admin  ·  /cumplimentado?t=TOKEN  ·  /company?t=TOKEN   (un token por cuenta y rol)
+ * Estados:   setup -> honoree -> open -> closed   (honoree se omite si no hay exentos ni invitados)
+ * Reglas:    v2 (cuentas nuevas) y v1 (históricas, solo lectura/continuación).
  */
 const http = require('node:http');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
-const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
 
+const { openDb, newToken } = require('./lib/db');
+const { calcularCuota, cuotaProporcional } = require('./lib/split');
+const { createAuth } = require('./lib/auth');
+const { createLimiter, clientIp } = require('./lib/ratelimit');
+const backup = require('./lib/backup');
+
+/* --------------------------------------------------------------- Config */
+
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const PROD = NODE_ENV === 'production';
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
-if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT inválido');
-if (process.env.NODE_ENV === 'production' && !process.env.ADMIN_PIN) {
-  throw new Error('ADMIN_PIN es obligatorio en producción.');
-}
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'cuenta.db');
-const ADMIN_PIN = process.env.ADMIN_PIN || '';
+const ADMIN_SECRET = process.env.ADMIN_PASSWORD || process.env.ADMIN_PIN || '';
 const CURRENCY = process.env.CURRENCY || 'COP';
 const LOCALE = process.env.LOCALE || 'es-CO';
+const TRUST_PROXY = process.env.TRUST_PROXY ? process.env.TRUST_PROXY === '1' : PROD;
+const RATE_LIMIT = process.env.RATE_LIMIT !== 'off';
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DB_PATH), 'backups');
+const BACKUP_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS ?? 6);
+const BACKUP_KEEP = Number(process.env.BACKUP_KEEP ?? 14);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-/* ------------------------------------------------------------------ DB */
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT inválido');
+if (PROD && ADMIN_SECRET.length < 10) {
+  throw new Error('En producción ADMIN_PASSWORD (o ADMIN_PIN) es obligatorio y debe tener al menos 10 caracteres.');
+}
 
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new DatabaseSync(DB_PATH);
-db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
-db.exec(`
-CREATE TABLE IF NOT EXISTS events (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  name        TEXT    NOT NULL,
-  tip_percent REAL    NOT NULL DEFAULT 10 CHECK (tip_percent >= 0 AND tip_percent <= 100),
-  status      TEXT    NOT NULL DEFAULT 'setup' CHECK (status IN ('setup','honoree','open','closed')),
-  created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS items (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  event_id   INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-  name       TEXT    NOT NULL,
-  unit_price INTEGER NOT NULL CHECK (unit_price >= 0),
-  qty        INTEGER NOT NULL CHECK (qty > 0),
-  position   INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS honoree_items (
-  item_id INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
-  qty     INTEGER NOT NULL CHECK (qty > 0)
-);
-CREATE TABLE IF NOT EXISTS guests (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  event_id      INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-  name          TEXT    NOT NULL,
-  subtotal      INTEGER NOT NULL,
-  tip_share     INTEGER NOT NULL,
-  honoree_share INTEGER NOT NULL,
-  total         INTEGER NOT NULL,
-  created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
-);
-CREATE TABLE IF NOT EXISTS guest_items (
-  guest_id INTEGER NOT NULL REFERENCES guests(id) ON DELETE CASCADE,
-  item_id  INTEGER NOT NULL REFERENCES items(id)  ON DELETE CASCADE,
-  qty      INTEGER NOT NULL CHECK (qty > 0),
-  PRIMARY KEY (guest_id, item_id)
-);
-CREATE INDEX IF NOT EXISTS idx_items_event  ON items(event_id);
-CREATE INDEX IF NOT EXISTS idx_guests_event ON guests(event_id);
-`);
+const db = openDb(DB_PATH);
+const auth = createAuth({ secret: ADMIN_SECRET, secure: PROD });
+const limiter = createLimiter({ enabled: RATE_LIMIT });
 
 function tx(fn) {
   db.exec('BEGIN IMMEDIATE');
@@ -80,8 +55,6 @@ function tx(fn) {
   }
 }
 
-/* ------------------------------------------------------------ Dominio */
-
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -89,38 +62,66 @@ class HttpError extends Error {
   }
 }
 
-const currentEvent = () => db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 1').get() || null;
+/* -------------------------------------------------------------- Dominio */
 
-/** Ítems del evento con cantidades ya tomadas (cumplimentado / invitados). */
-function loadPricing(ev) {
-  const items = db
-    .prepare(
-      `SELECT i.id, i.name, i.unit_price AS price, i.qty,
-              COALESCE(h.qty, 0) AS honoreeQty,
-              COALESCE((SELECT SUM(gi.qty) FROM guest_items gi WHERE gi.item_id = i.id), 0) AS guestsQty
-         FROM items i
-         LEFT JOIN honoree_items h ON h.item_id = i.id
-        WHERE i.event_id = ?
-        ORDER BY i.position, i.id`
-    )
-    .all(ev.id)
-    .map((i) => ({ ...i, available: i.qty - i.honoreeQty - i.guestsQty }));
+const eventById = (id) => {
+  const ev = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
+  if (!ev) throw new HttpError(404, 'Cuenta no encontrada.');
+  return ev;
+};
 
-  const S = items.reduce((a, i) => a + i.price * i.qty, 0); // subtotal de la factura
-  const H = items.reduce((a, i) => a + i.price * i.honoreeQty, 0); // consumo del cumplimentado
-  const T = Math.round((S * ev.tip_percent) / 100); // propina total
-  const Sg = S - H; // consumo de quienes pagan
-  return { items, S, H, T, Sg, tipPercent: ev.tip_percent };
+function eventByToken(kind, query) {
+  const t = query.get('t') || '';
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(t)) return null;
+  const col = kind === 'honoree' ? 'honoree_token' : 'company_token';
+  return db.prepare(`SELECT * FROM events WHERE ${col} = ?`).get(t) || null;
 }
 
-/**
- * Total de un invitado = su consumo c
- *   + c/Sg * T   (su parte de la propina)
- *   + c/Sg * H   (su parte de lo consumido por el cumplimentado)
- * Aritmética entera; el redondeo es al peso más cercano.
- */
-function computeQuote(p, selection) {
-  const byId = new Map(p.items.map((i) => [i.id, i]));
+/** Fotografía completa de una cuenta: ítems con unidades tomadas, personas y totales. */
+function loadModel(ev) {
+  const v2 = ev.rules_version === 2;
+  const items = db
+    .prepare(
+      `SELECT i.id, i.name, i.unit_price AS price, i.qty, i.is_tip AS isTip,
+              COALESCE((SELECT SUM(pi.qty) FROM person_items pi WHERE pi.item_id = i.id), 0) AS peopleQty,
+              COALESCE((SELECT SUM(gi.qty) FROM guest_items gi WHERE gi.item_id = i.id), 0) AS guestsQty
+         FROM items i WHERE i.event_id = ? ORDER BY i.position, i.id`
+    )
+    .all(ev.id)
+    .map((i) => ({
+      id: i.id, name: i.name, price: i.price, qty: i.qty, isTip: !!i.isTip,
+      peopleQty: i.peopleQty, guestsQty: i.guestsQty,
+      available: i.isTip ? 0 : i.qty - i.peopleQty - i.guestsQty,
+    }));
+  const people = db
+    .prepare(
+      `SELECT p.id, p.name, p.kind, p.registered_at AS registeredAt,
+              COALESCE(SUM(pi.qty * i.unit_price), 0) AS consumption
+         FROM people p
+         LEFT JOIN person_items pi ON pi.person_id = p.id
+         LEFT JOIN items i ON i.id = pi.item_id
+        WHERE p.event_id = ? GROUP BY p.id ORDER BY p.position, p.id`
+    )
+    .all(ev.id);
+
+  const S = items.filter((i) => !i.isTip).reduce((a, i) => a + i.price * i.qty, 0); // consumos (sin propina)
+  const T = items.filter((i) => i.isTip).reduce((a, i) => a + i.price * i.qty, 0); // propina manual
+  const E = people.filter((p) => p.kind === 'exempt').reduce((a, p) => a + p.consumption, 0);
+  const G = people.filter((p) => p.kind === 'guest').reduce((a, p) => a + p.consumption, 0);
+  const tipTotal = v2 ? T : Math.round((S * ev.tip_percent) / 100);
+  return {
+    ev, v2, items, people, S, E, G, tipTotal,
+    peopleConsumption: E + G,
+    shared: tipTotal + E + G, // v2: lo que se reparte en partes iguales
+    payers: ev.payers_count,
+    invoiceTotal: S + tipTotal,
+    payersConsumption: S - E - G,
+  };
+}
+
+/** Desglose de lo que paga un participante que consumió `selection` (Map itemId -> qty). */
+function computeQuote(m, selection) {
+  const byId = new Map(m.items.map((i) => [i.id, i]));
   const lines = [];
   let c = 0;
   for (const [itemId, qty] of selection) {
@@ -129,16 +130,28 @@ function computeQuote(p, selection) {
     c += amount;
     lines.push({ itemId, name: it.name, qty, unitPrice: it.price, amount });
   }
-  const tipShare = p.Sg > 0 ? Math.round((c * p.T) / p.Sg) : 0;
-  const honoreeShare = p.Sg > 0 ? Math.round((c * p.H) / p.Sg) : 0;
+  if (m.v2) {
+    let q;
+    try {
+      q = calcularCuota({ consumo: c, compartido: m.shared, pagadores: m.payers });
+    } catch (err) {
+      throw new HttpError(409, err.message);
+    }
+    const tipShare = Math.floor(m.tipTotal / m.payers);
+    const othersShare = Math.floor((m.E + m.G) / m.payers);
+    return {
+      kind: 'v2', lines, subtotal: c, payers: m.payers,
+      tipShare, othersShare, adjustment: q.total - c - tipShare - othersShare,
+      total: q.total, exact: q.exacto, roundingDiff: q.diferencia,
+    };
+  }
+  const r = cuotaProporcional({
+    consumo: c, consumoPagadores: m.payersConsumption, propina: m.tipTotal, consumoExentos: m.peopleConsumption,
+  });
   return {
-    lines,
-    subtotal: c,
-    tipPercent: p.tipPercent,
-    tipShare,
-    honoreeShare,
-    total: c + tipShare + honoreeShare,
-    sharePercent: p.Sg > 0 ? Math.round((c / p.Sg) * 10000) / 100 : 0,
+    kind: 'v1', lines, subtotal: c, tipPercent: m.ev.tip_percent,
+    tipShare: r.tipShare, honoreeShare: r.honoreeShare, total: r.total, exact: r.total, roundingDiff: 0,
+    sharePercent: m.payersConsumption > 0 ? Math.round((c / m.payersConsumption) * 10000) / 100 : 0,
   };
 }
 
@@ -150,6 +163,7 @@ function normalizeSelection(raw, items, limitFn) {
     const id = Number(row && row.itemId);
     const qty = Number(row && row.qty);
     if (!Number.isInteger(id) || !byId.has(id)) throw new HttpError(400, 'Ítem inválido.');
+    if (byId.get(id).isTip) throw new HttpError(400, 'Ítem inválido.');
     if (!Number.isInteger(qty) || qty < 0) throw new HttpError(400, 'Cantidad inválida.');
     if (qty === 0) continue;
     out.set(id, (out.get(id) || 0) + qty);
@@ -160,29 +174,43 @@ function normalizeSelection(raw, items, limitFn) {
     if (qty > max) {
       throw new HttpError(
         409,
-        max <= 0
-          ? `"${it.name}" ya no tiene unidades disponibles.`
-          : `De "${it.name}" solo quedan ${max} disponible(s).`
+        max <= 0 ? `"${it.name}" ya no tiene unidades disponibles.` : `De "${it.name}" solo quedan ${max} disponible(s).`
       );
     }
   }
   return out;
 }
 
+const cleanName = (s) => String(s == null ? '' : s).trim().replace(/\s+/g, ' ');
+
 function validateEventPayload(body) {
-  const name = String((body && body.name) || '').trim() || 'Cuenta';
+  const b = body || {};
+  const name = cleanName(b.name) || 'Cuenta';
   if (name.length > 80) throw new HttpError(400, 'El nombre es demasiado largo (máx. 80).');
-  const tip = Number(body && body.tipPercent);
-  if (!Number.isFinite(tip) || tip < 0 || tip > 100) {
-    throw new HttpError(400, 'La propina debe estar entre 0 y 100 %.');
+  const payersCount = Number(b.payersCount);
+  if (!Number.isInteger(payersCount) || payersCount < 0 || payersCount > 500) {
+    throw new HttpError(400, 'El número de participantes que pagan debe ser un entero entre 0 y 500.');
   }
-  const rawItems = body && body.items;
-  if (!Array.isArray(rawItems) || rawItems.length === 0) {
-    throw new HttpError(400, 'Agrega al menos un ítem.');
+  const seen = new Set();
+  const people = [];
+  for (const [key, kind, label] of [['exempt', 'exempt', 'exentos'], ['guests', 'guest', 'invitados']]) {
+    const arr = b[key] == null ? [] : b[key];
+    if (!Array.isArray(arr) || arr.length > 50) throw new HttpError(400, `Lista de ${label} inválida (máx. 50).`);
+    for (const raw of arr) {
+      const n = cleanName(raw);
+      if (!n) continue;
+      if (n.length > 60) throw new HttpError(400, `Nombre demasiado largo en ${label} (máx. 60).`);
+      const k = n.toLowerCase();
+      if (seen.has(k)) throw new HttpError(400, `"${n}" está repetido entre exentos e invitados.`);
+      seen.add(k);
+      people.push({ name: n, kind });
+    }
   }
+  const rawItems = b.items;
+  if (!Array.isArray(rawItems) || rawItems.length === 0) throw new HttpError(400, 'Agrega al menos un ítem.');
   if (rawItems.length > 200) throw new HttpError(400, 'Demasiados ítems (máx. 200).');
   const items = rawItems.map((r, idx) => {
-    const n = String((r && r.name) || '').trim();
+    const n = cleanName(r && r.name);
     const price = Number(r && r.price);
     const qty = Number(r && r.qty);
     if (!n || n.length > 80) throw new HttpError(400, `Ítem ${idx + 1}: nombre inválido.`);
@@ -192,236 +220,426 @@ function validateEventPayload(body) {
     if (!Number.isInteger(qty) || qty < 1 || qty > 1000) {
       throw new HttpError(400, `"${n}": la cantidad debe ser un entero entre 1 y 1000.`);
     }
-    return { name: n, price, qty };
+    let id = null;
+    if (r.id != null) {
+      id = Number(r.id);
+      if (!Number.isInteger(id)) throw new HttpError(400, `"${n}": identificador inválido.`);
+    }
+    return { id, name: n, price, qty, isTip: r.isTip === true };
   });
-  return { name, tipPercent: Math.round(tip * 100) / 100, items };
+  if (!items.some((i) => !i.isTip)) throw new HttpError(400, 'Agrega al menos un ítem de consumo (no propina).');
+  return { name, payersCount, people, items };
 }
 
-function insertItems(eventId, items) {
-  const ins = db.prepare('INSERT INTO items (event_id, name, unit_price, qty, position) VALUES (?,?,?,?,?)');
-  items.forEach((i, idx) => ins.run(eventId, i.name, i.price, i.qty, idx));
+function insertPeople(eventId, people) {
+  const ins = db.prepare('INSERT INTO people (event_id, name, kind, position) VALUES (?,?,?,?)');
+  people.forEach((p, idx) => ins.run(eventId, p.name, p.kind, idx));
 }
 
-/* ----------------------------------------------------------- Handlers */
+function createEvent(data) {
+  return tx(() => {
+    const r = db
+      .prepare(
+        `INSERT INTO events (name, tip_percent, rules_version, payers_count, company_token, honoree_token)
+         VALUES (?, 0, 2, ?, ?, ?)`
+      )
+      .run(data.name, data.payersCount, newToken(), newToken());
+    const id = Number(r.lastInsertRowid);
+    const ins = db.prepare('INSERT INTO items (event_id, name, unit_price, qty, is_tip, position) VALUES (?,?,?,?,?,?)');
+    data.items.forEach((i, idx) => ins.run(id, i.name, i.price, i.qty, i.isTip ? 1 : 0, idx));
+    insertPeople(id, data.people);
+    return id;
+  });
+}
 
-const routes = [];
-const route = (method, pattern, handler, opts = {}) =>
-  routes.push({ method, re: new RegExp(`^${pattern}$`), handler, ...opts });
+const claimedUnits = (itemId) =>
+  db
+    .prepare(
+      `SELECT COALESCE((SELECT SUM(qty) FROM person_items WHERE item_id = ?), 0)
+            + COALESCE((SELECT SUM(qty) FROM guest_items  WHERE item_id = ?), 0) AS n`
+    )
+    .get(itemId, itemId).n;
 
-route('GET', '/api/config', () => ({ currency: CURRENCY, locale: LOCALE }));
+/** Recalcula las cuotas guardadas tras editar la cuenta. Rechaza si cambiaría una cuota ya pagada. */
+function recomputeGuests(evId) {
+  const m = loadModel(eventById(evId));
+  const guests = db.prepare('SELECT id, name, total, paid_at FROM guests WHERE event_id = ?').all(evId);
+  const sel = db.prepare('SELECT item_id, qty FROM guest_items WHERE guest_id = ?');
+  const upd = db.prepare(
+    'UPDATE guests SET subtotal=?, tip_share=?, honoree_share=?, total=?, calc_exact=?, rounding_diff=? WHERE id=?'
+  );
+  let changed = 0;
+  for (const g of guests) {
+    const b = computeQuote(m, new Map(sel.all(g.id).map((r) => [r.item_id, r.qty])));
+    if (b.total !== g.total) {
+      if (g.paid_at) {
+        throw new HttpError(409, `El cambio modificaría la cuota de ${g.name}, que ya está marcada como pagada. Desmarca el pago primero.`);
+      }
+      changed++;
+    }
+    upd.run(b.subtotal, b.tipShare, b.kind === 'v2' ? b.othersShare : b.honoreeShare, b.total, b.exact, b.roundingDiff, g.id);
+  }
+  return changed;
+}
 
-/* ---- Admin ---- */
+/** Guarda cambios. En setup reemplaza todo; después fusiona ítems por id y recalcula las cuotas. */
+function saveEvent(id, data) {
+  return tx(() => {
+    const ev = eventById(id);
+    if (ev.status === 'closed') throw new HttpError(409, 'La cuenta está cerrada; no se puede editar.');
+    if (ev.rules_version !== 2) {
+      throw new HttpError(409, 'Las cuentas históricas (propina porcentual) no se pueden editar.');
+    }
+    if (ev.status !== 'setup') {
+      const registered = db.prepare('SELECT COUNT(*) AS n FROM guests WHERE event_id = ?').get(id).n;
+      if (data.payersCount < registered) {
+        throw new HttpError(409, `Ya hay ${registered} participante(s) registrados; el número de pagadores no puede ser menor.`);
+      }
+    }
+    const existing = db.prepare('SELECT id, name FROM items WHERE event_id = ?').all(id);
+    const keep = new Set();
+    const insItem = db.prepare('INSERT INTO items (event_id, name, unit_price, qty, is_tip, position) VALUES (?,?,?,?,?,?)');
+    const updItem = db.prepare('UPDATE items SET name=?, unit_price=?, qty=?, is_tip=?, position=? WHERE id=? AND event_id=?');
+    data.items.forEach((it, idx) => {
+      if (it.id == null) return insItem.run(id, it.name, it.price, it.qty, it.isTip ? 1 : 0, idx);
+      if (!existing.some((e) => e.id === it.id)) throw new HttpError(400, `"${it.name}": ítem desconocido.`);
+      keep.add(it.id);
+      const n = claimedUnits(it.id);
+      if (it.qty < n) throw new HttpError(409, `"${it.name}": ya hay ${n} unidad(es) tomada(s); la cantidad no puede ser menor.`);
+      if (it.isTip && n > 0) throw new HttpError(409, `"${it.name}" ya tiene consumos registrados y no puede marcarse como propina.`);
+      updItem.run(it.name, it.price, it.qty, it.isTip ? 1 : 0, idx, it.id, id);
+    });
+    for (const ex of existing) {
+      if (keep.has(ex.id)) continue;
+      if (claimedUnits(ex.id) > 0) throw new HttpError(409, `No puedes quitar "${ex.name}" porque ya tiene consumos registrados.`);
+      db.prepare('DELETE FROM items WHERE id = ?').run(ex.id);
+    }
+    db.prepare('UPDATE events SET name = ?, payers_count = ? WHERE id = ?').run(data.name, data.payersCount, id);
+    let changed = 0;
+    if (ev.status === 'setup') {
+      db.prepare('DELETE FROM people WHERE event_id = ?').run(id);
+      insertPeople(id, data.people);
+    } else if (ev.status === 'open') {
+      changed = recomputeGuests(id);
+    }
+    return { changed };
+  });
+}
 
-function adminState() {
-  const ev = currentEvent();
-  if (!ev) return { event: null };
-  const p = loadPricing(ev);
+/* --------------------------------------------------------------- Admin */
+
+function adminState(ev) {
+  const m = loadModel(ev);
+  const gi = db
+    .prepare(
+      `SELECT gi.guest_id AS gid, gi.qty, i.name FROM guest_items gi
+         JOIN items i ON i.id = gi.item_id JOIN guests g ON g.id = gi.guest_id WHERE g.event_id = ? ORDER BY i.position, i.id`
+    )
+    .all(ev.id);
   const guests = db
     .prepare('SELECT * FROM guests WHERE event_id = ? ORDER BY id')
     .all(ev.id)
     .map((g) => ({
-      id: g.id,
-      name: g.name,
-      subtotal: g.subtotal,
-      tipShare: g.tip_share,
-      honoreeShare: g.honoree_share,
-      total: g.total,
-      createdAt: g.created_at,
+      id: g.id, name: g.name, subtotal: g.subtotal, tipShare: g.tip_share, othersShare: g.honoree_share,
+      total: g.total, calcExact: g.calc_exact, roundingDiff: g.rounding_diff, paidAt: g.paid_at, createdAt: g.created_at,
+      items: gi.filter((x) => x.gid === g.id).map((x) => ({ name: x.name, qty: x.qty })),
     }));
   const collected = guests.reduce((a, g) => a + g.total, 0);
+  const paid = guests.filter((g) => g.paidAt).reduce((a, g) => a + g.total, 0);
+  const unclaimed = m.items.filter((i) => !i.isTip);
   return {
-    event: { id: ev.id, name: ev.name, tipPercent: ev.tip_percent, status: ev.status, createdAt: ev.created_at },
-    items: p.items,
+    event: {
+      id: ev.id, name: ev.name, status: ev.status, rulesVersion: ev.rules_version, payersCount: ev.payers_count,
+      tipPercent: ev.rules_version === 1 ? ev.tip_percent : null, createdAt: ev.created_at,
+      links: { honoree: `/cumplimentado?t=${ev.honoree_token}`, company: `/company?t=${ev.company_token}` },
+    },
+    items: m.items,
+    people: m.people.map((p) => ({ id: p.id, name: p.name, kind: p.kind, registered: !!p.registeredAt, consumption: p.consumption })),
     guests,
     summary: {
-      subtotal: p.S,
-      tip: p.T,
-      invoiceTotal: p.S + p.T,
-      honoreeConsumption: p.H,
-      payersConsumption: p.Sg,
-      collected,
-      pending: p.S + p.T - collected,
+      invoiceTotal: m.invoiceTotal, consumptionTotal: m.S, tipTotal: m.tipTotal,
+      exemptConsumption: m.E, guestConsumption: m.G, sharedTotal: m.shared,
+      payersCount: ev.payers_count, payersRegistered: guests.length,
+      sharePerPayer: ev.payers_count > 0 ? Math.round((m.shared / ev.payers_count) * 100) / 100 : 0,
+      collected, paid, awaitingPayment: collected - paid,
+      roundingDiff: Math.round(guests.reduce((a, g) => a + (g.roundingDiff || 0), 0) * 100) / 100,
+      difference: collected - m.invoiceTotal,
+      unclaimedUnits: unclaimed.reduce((a, i) => a + i.available, 0),
+      unclaimedValue: unclaimed.reduce((a, i) => a + i.available * i.price, 0),
     },
   };
 }
 
-route('GET', '/api/admin/state', () => adminState(), { admin: true });
+const csvCell = (v) => {
+  let s = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`; // evita inyección de fórmulas en Excel/Sheets
+  return /[",\n\r;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
 
-route(
-  'POST',
-  '/api/admin/event',
-  ({ body }) => {
-    const data = validateEventPayload(body);
-    tx(() => {
-      db.prepare("UPDATE events SET status = 'closed' WHERE status != 'closed'").run();
-      const r = db.prepare('INSERT INTO events (name, tip_percent) VALUES (?, ?)').run(data.name, data.tipPercent);
-      insertItems(Number(r.lastInsertRowid), data.items);
-    });
-    return adminState();
-  },
-  { admin: true }
-);
+function exportCsv(ev) {
+  const s = adminState(ev);
+  const head = ['Nombre', 'Ítems', 'Consumo', 'Parte de propina', 'Parte de exentos e invitados', 'Total a pagar',
+    'Calculado sin redondeo', 'Diferencia por redondeo', 'Pagado', 'Registrado'];
+  const rows = s.guests.map((g) => [
+    g.name, g.items.map((i) => `${i.qty}x ${i.name}`).join(' | '), g.subtotal, g.tipShare, g.othersShare, g.total,
+    g.calcExact, g.roundingDiff, g.paidAt ? 'Sí' : 'No', g.createdAt,
+  ]);
+  rows.push([], ['Total factura', '', '', '', '', s.summary.invoiceTotal], ['Recaudo registrado', '', '', '', '', s.summary.collected],
+    ['Diferencia vs factura', '', '', '', '', s.summary.difference], ['Pagado', '', '', '', '', s.summary.paid]);
+  return '\ufeff' + [head, ...rows].map((r) => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
+}
 
-route(
-  'PUT',
-  '/api/admin/event',
-  ({ body }) => {
-    const data = validateEventPayload(body);
-    tx(() => {
-      const ev = currentEvent();
-      if (!ev) throw new HttpError(404, 'No hay una cuenta creada.');
-      if (ev.status !== 'setup') throw new HttpError(409, 'La cuenta ya fue habilitada; no se puede editar.');
-      db.prepare('UPDATE events SET name = ?, tip_percent = ? WHERE id = ?').run(data.name, data.tipPercent, ev.id);
-      db.prepare('DELETE FROM items WHERE event_id = ?').run(ev.id);
-      insertItems(ev.id, data.items);
-    });
-    return adminState();
-  },
-  { admin: true }
-);
+/* -------------------------------------------------------------- Rutas */
 
-route(
-  'POST',
-  '/api/admin/event/publish',
-  () => {
-    tx(() => {
-      const ev = currentEvent();
-      if (!ev) throw new HttpError(404, 'No hay una cuenta creada.');
-      if (ev.status !== 'setup') throw new HttpError(409, 'La cuenta ya fue habilitada.');
-      const n = db.prepare('SELECT COUNT(*) AS n FROM items WHERE event_id = ?').get(ev.id).n;
-      if (n === 0) throw new HttpError(400, 'Agrega al menos un ítem.');
-      db.prepare("UPDATE events SET status = 'honoree' WHERE id = ?").run(ev.id);
-    });
-    return adminState();
-  },
-  { admin: true }
-);
+const routes = [];
+const route = (method, pattern, handler, opts = {}) => routes.push({ method, re: new RegExp(`^${pattern}$`), handler, ...opts });
+const evFrom = (ctx) => eventById(Number(ctx.params[0]));
 
-route(
-  'POST',
-  '/api/admin/event/unpublish',
-  () => {
-    tx(() => {
-      const ev = currentEvent();
-      if (!ev || ev.status !== 'honoree') {
-        throw new HttpError(409, 'Solo se puede volver a editar antes de que el cumplimentado registre su consumo.');
-      }
-      db.prepare("UPDATE events SET status = 'setup' WHERE id = ?").run(ev.id);
-    });
-    return adminState();
-  },
-  { admin: true }
-);
+route('GET', '/api/config', () => ({ currency: CURRENCY, locale: LOCALE }));
 
-route(
-  'POST',
-  '/api/admin/event/close',
-  () => {
-    tx(() => {
-      const ev = currentEvent();
-      if (!ev || ev.status === 'setup' || ev.status === 'closed') {
-        throw new HttpError(409, 'No hay un cobro activo para cerrar.');
-      }
-      db.prepare("UPDATE events SET status = 'closed' WHERE id = ?").run(ev.id);
-    });
-    return adminState();
-  },
-  { admin: true }
-);
+/* ---- Sesión de administrador ---- */
+route('GET', '/api/admin/session', ({ req }) => ({ required: auth.enabled, authenticated: auth.isAuthed(req) }));
 
-route(
-  'DELETE',
-  '/api/admin/guests/(\\d+)',
-  ({ params }) => {
-    const ev = currentEvent();
-    if (!ev) throw new HttpError(404, 'No hay una cuenta creada.');
+route('POST', '/api/admin/login', ({ req, res, body, ip }) => {
+  const key = `login:${ip}`;
+  const blocked = limiter.blocked(key, 8, 600_000);
+  if (!blocked.ok) throw Object.assign(new HttpError(429, 'Demasiados intentos. Espera unos minutos.'), { retry: blocked.retry });
+  if (!auth.enabled) return { ok: true };
+  if (!auth.checkPassword((body && body.password) || '')) {
+    limiter.fail(key, 600_000);
+    throw new HttpError(401, 'Contraseña incorrecta.');
+  }
+  limiter.reset(key);
+  auth.setCookie(res);
+  return { ok: true };
+});
+
+route('POST', '/api/admin/logout', ({ res }) => {
+  auth.clearCookie(res);
+  return { ok: true };
+});
+
+/* ---- Cuentas ---- */
+route('GET', '/api/admin/events', () => ({
+  events: db
+    .prepare(
+      `SELECT e.id, e.name, e.status, e.rules_version AS rulesVersion, e.created_at AS createdAt,
+              (SELECT COUNT(*) FROM guests g WHERE g.event_id = e.id) AS guests
+         FROM events e ORDER BY e.id DESC LIMIT 200`
+    )
+    .all(),
+}), { admin: true });
+
+route('POST', '/api/admin/events', ({ body }) => {
+  const id = createEvent(validateEventPayload(body));
+  return adminState(eventById(id));
+}, { admin: true });
+
+route('GET', '/api/admin/events/(\\d+)', (ctx) => adminState(evFrom(ctx)), { admin: true });
+
+route('PUT', '/api/admin/events/(\\d+)', (ctx) => {
+  const ev = evFrom(ctx);
+  const { changed } = saveEvent(ev.id, validateEventPayload(ctx.body));
+  return { ...adminState(eventById(ev.id)), recalculated: changed };
+}, { admin: true });
+
+route('POST', '/api/admin/events/(\\d+)/publish', (ctx) => {
+  tx(() => {
+    const ev = evFrom(ctx);
+    if (ev.status !== 'setup') throw new HttpError(409, 'La cuenta ya fue habilitada.');
+    const m = loadModel(ev);
+    if (!m.items.some((i) => !i.isTip)) throw new HttpError(400, 'Agrega al menos un ítem de consumo.');
+    if (ev.rules_version === 2 && ev.payers_count < 1) {
+      throw new HttpError(400, 'Indica cuántos participantes pagan (al menos 1).');
+    }
+    const next = m.people.length ? 'honoree' : 'open';
+    db.prepare('UPDATE events SET status = ? WHERE id = ?').run(next, ev.id);
+  });
+  return adminState(evFrom(ctx));
+}, { admin: true });
+
+route('POST', '/api/admin/events/(\\d+)/unpublish', (ctx) => {
+  tx(() => {
+    const ev = evFrom(ctx);
+    const reg = db.prepare('SELECT COUNT(*) AS n FROM people WHERE event_id = ? AND registered_at IS NOT NULL').get(ev.id).n;
+    if (ev.status !== 'honoree' || reg > 0) {
+      throw new HttpError(409, 'Solo se puede volver a editar antes de que alguien registre su consumo.');
+    }
+    db.prepare("UPDATE events SET status = 'setup' WHERE id = ?").run(ev.id);
+  });
+  return adminState(evFrom(ctx));
+}, { admin: true });
+
+route('POST', '/api/admin/events/(\\d+)/close', (ctx) => {
+  tx(() => {
+    const ev = evFrom(ctx);
+    if (ev.status !== 'honoree' && ev.status !== 'open') throw new HttpError(409, 'No hay un cobro activo para cerrar.');
+    const n = db.prepare('SELECT COUNT(*) AS n FROM guests WHERE event_id = ?').get(ev.id).n;
+    if (ev.rules_version === 2 && n !== ev.payers_count && n !== 0) {
+      throw new HttpError(409, `No se puede cerrar: hay ${n} de ${ev.payers_count} participantes registrados (cuotas pendientes de cálculo).`);
+    }
+    db.prepare("UPDATE events SET status = 'closed' WHERE id = ?").run(ev.id);
+  });
+  return adminState(evFrom(ctx));
+}, { admin: true });
+
+route('POST', '/api/admin/events/(\\d+)/tokens/rotate', (ctx) => {
+  const ev = evFrom(ctx);
+  if (ev.status === 'closed') throw new HttpError(409, 'La cuenta está cerrada.');
+  db.prepare('UPDATE events SET company_token = ?, honoree_token = ? WHERE id = ?').run(newToken(), newToken(), ev.id);
+  return adminState(eventById(ev.id));
+}, { admin: true });
+
+route('DELETE', '/api/admin/events/(\\d+)/guests/(\\d+)', (ctx) => {
+  tx(() => {
+    const ev = evFrom(ctx);
     if (ev.status === 'closed') throw new HttpError(409, 'El cobro está cerrado.');
-    const r = db.prepare('DELETE FROM guests WHERE id = ? AND event_id = ?').run(Number(params[0]), ev.id);
-    if (r.changes === 0) throw new HttpError(404, 'Registro no encontrado.');
-    return adminState();
-  },
-  { admin: true }
-);
+    const g = db.prepare('SELECT paid_at FROM guests WHERE id = ? AND event_id = ?').get(Number(ctx.params[1]), ev.id);
+    if (!g) throw new HttpError(404, 'Registro no encontrado.');
+    if (g.paid_at) throw new HttpError(409, 'Ese registro está marcado como pagado; desmarca el pago primero.');
+    db.prepare('DELETE FROM guests WHERE id = ?').run(Number(ctx.params[1]));
+  });
+  return adminState(evFrom(ctx));
+}, { admin: true });
 
-/* ---- Cumplimentado (nunca expone precios ni propina) ---- */
+route('POST', '/api/admin/events/(\\d+)/guests/(\\d+)/paid', (ctx) => {
+  const ev = evFrom(ctx);
+  if (ev.status !== 'open' && ev.status !== 'closed') throw new HttpError(409, 'Aún no hay cobro activo.');
+  const paid = ctx.body && ctx.body.paid === true;
+  const r = db
+    .prepare('UPDATE guests SET paid_at = ? WHERE id = ? AND event_id = ?')
+    .run(paid ? new Date().toISOString() : null, Number(ctx.params[1]), ev.id);
+  if (r.changes === 0) throw new HttpError(404, 'Registro no encontrado.');
+  return adminState(ev);
+}, { admin: true });
 
-route('GET', '/api/honoree', () => {
-  const ev = currentEvent();
-  if (!ev) return { status: 'none' };
+route('GET', '/api/admin/events/(\\d+)/export.csv', (ctx) => {
+  const ev = evFrom(ctx);
+  const slug = ev.name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase() || 'cuenta';
+  return {
+    raw: true, status: 200,
+    headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="${slug}-${ev.id}.csv"` },
+    body: exportCsv(ev),
+  };
+}, { admin: true });
+
+route('GET', '/api/admin/backup', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bk-'));
+  try {
+    const file = backup.snapshot(db, dir, 1);
+    return {
+      raw: true, status: 200,
+      headers: { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename="cuenta-${new Date().toISOString().slice(0, 10)}.db"` },
+      body: fs.readFileSync(file),
+    };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}, { admin: true });
+
+/* ---- Cumplimentado (exentos e invitados): nunca expone precios ni propina ---- */
+
+route('GET', '/api/honoree', ({ query }) => {
+  const ev = eventByToken('honoree', query);
+  if (!ev) return { status: 'invalid' };
   if (ev.status === 'setup') return { status: 'setup', eventName: ev.name };
-  const p = loadPricing(ev);
+  const m = loadModel(ev);
   return {
     status: ev.status,
     eventName: ev.name,
-    items: p.items.map((i) => ({ id: i.id, name: i.name, qty: i.qty, selected: i.honoreeQty })),
+    people: m.people.map((p) => ({ id: p.id, name: p.name, kind: p.kind, registered: !!p.registeredAt })),
+    items: m.items.filter((i) => !i.isTip).map((i) => ({ id: i.id, name: i.name, qty: i.qty, remaining: i.qty - i.peopleQty })),
   };
 });
 
-route('POST', '/api/honoree', ({ body }) => {
+route('POST', '/api/honoree', ({ query, body }) => {
   return tx(() => {
-    const ev = currentEvent();
-    if (!ev || ev.status !== 'honoree') {
-      throw new HttpError(409, 'Esta cuenta no está esperando el consumo del cumplimentado.');
-    }
-    const p = loadPricing(ev);
-    const sel = normalizeSelection(body && body.selection, p.items, (it) => it.qty);
-    const ins = db.prepare('INSERT INTO honoree_items (item_id, qty) VALUES (?, ?)');
-    for (const [itemId, qty] of sel) ins.run(itemId, qty);
-    db.prepare("UPDATE events SET status = 'open' WHERE id = ?").run(ev.id);
-    return { status: 'open', saved: sel.size };
+    const found = eventByToken('honoree', query);
+    if (!found) throw new HttpError(404, 'Enlace inválido.');
+    const ev = eventById(found.id);
+    if (ev.status !== 'honoree') throw new HttpError(409, 'Esta cuenta no está esperando consumos de exentos o invitados.');
+    const m = loadModel(ev);
+    const pending = m.people.filter((p) => !p.registeredAt);
+    let person;
+    if (body && body.personId != null) person = m.people.find((p) => p.id === Number(body.personId));
+    else if (pending.length === 1) person = pending[0];
+    if (!person) throw new HttpError(400, 'Elige quién eres en la lista.');
+    if (person.registeredAt) throw new HttpError(409, `${person.name} ya registró su consumo.`);
+    const sel = normalizeSelection(body && body.selection, m.items, (it) => it.qty - it.peopleQty);
+    const ins = db.prepare('INSERT INTO person_items (person_id, item_id, qty) VALUES (?, ?, ?)');
+    for (const [itemId, qty] of sel) ins.run(person.id, itemId, qty);
+    db.prepare("UPDATE people SET registered_at = datetime('now') WHERE id = ?").run(person.id);
+    const left = pending.length - 1;
+    if (left === 0) db.prepare("UPDATE events SET status = 'open' WHERE id = ?").run(ev.id);
+    return { status: left === 0 ? 'open' : 'honoree', pending: left };
   });
 });
 
-/* ---- Invitados ---- */
+/* ---- Participantes que pagan ---- */
 
-route('GET', '/api/company', () => {
-  const ev = currentEvent();
-  if (!ev) return { status: 'none' };
+route('GET', '/api/company', ({ query }) => {
+  const ev = eventByToken('company', query);
+  if (!ev) return { status: 'invalid' };
   if (ev.status !== 'open') return { status: ev.status, eventName: ev.name };
-  const p = loadPricing(ev);
+  const m = loadModel(ev);
+  const registered = db.prepare('SELECT COUNT(*) AS n FROM guests WHERE event_id = ?').get(ev.id).n;
   return {
     status: 'open',
+    rulesVersion: ev.rules_version,
     eventName: ev.name,
-    tipPercent: ev.tip_percent,
-    items: p.items.map((i) => ({ id: i.id, name: i.name, price: i.price, available: i.available })),
+    tipPercent: ev.rules_version === 1 ? ev.tip_percent : null,
+    payersCount: ev.payers_count,
+    registered,
+    items: m.items.filter((i) => !i.isTip).map((i) => ({ id: i.id, name: i.name, price: i.price, available: i.available })),
   };
 });
 
-function openEventOrThrow() {
-  const ev = currentEvent();
-  if (!ev || ev.status !== 'open') throw new HttpError(409, 'El cobro todavía no está habilitado o ya fue cerrado.');
+function openEventFor(query) {
+  const found = eventByToken('company', query);
+  if (!found) throw new HttpError(404, 'Enlace inválido.');
+  const ev = eventById(found.id);
+  if (ev.status !== 'open') throw new HttpError(409, 'El cobro todavía no está habilitado o ya fue cerrado.');
   return ev;
 }
 
-function requireNonEmpty(sel) {
-  if (sel.size === 0) throw new HttpError(400, 'Selecciona al menos un ítem.');
+function checkSlots(ev) {
+  if (ev.rules_version !== 2) return;
+  const n = db.prepare('SELECT COUNT(*) AS n FROM guests WHERE event_id = ?').get(ev.id).n;
+  if (n >= ev.payers_count) throw new HttpError(409, 'Ya se registraron todos los participantes que pagan.');
 }
 
-route('POST', '/api/company/quote', ({ body }) => {
-  const ev = openEventOrThrow();
-  const p = loadPricing(ev);
-  const sel = normalizeSelection(body && body.selection, p.items, (it) => it.available);
+const requireNonEmpty = (sel) => {
+  if (sel.size === 0) throw new HttpError(400, 'Selecciona al menos un ítem.');
+};
+
+route('POST', '/api/company/quote', ({ query, body }) => {
+  const ev = openEventFor(query);
+  checkSlots(ev);
+  const m = loadModel(ev);
+  const sel = normalizeSelection(body && body.selection, m.items, (it) => it.available);
   requireNonEmpty(sel);
-  return { breakdown: computeQuote(p, sel) };
+  return { breakdown: computeQuote(m, sel) };
 });
 
-route('POST', '/api/company/guests', ({ body }) => {
-  const name = String((body && body.name) || '').trim().replace(/\s+/g, ' ');
+route('POST', '/api/company/guests', ({ query, body }) => {
+  const name = cleanName(body && body.name);
   if (!name) throw new HttpError(400, 'Escribe tu nombre.');
   if (name.length > 60) throw new HttpError(400, 'El nombre es demasiado largo (máx. 60).');
   return tx(() => {
-    const ev = openEventOrThrow();
-    const p = loadPricing(ev);
-    const sel = normalizeSelection(body && body.selection, p.items, (it) => it.available);
+    const ev = openEventFor(query);
+    checkSlots(ev);
+    const m = loadModel(ev);
+    const sel = normalizeSelection(body && body.selection, m.items, (it) => it.available);
     requireNonEmpty(sel);
-    const dup = db
-      .prepare('SELECT 1 AS x FROM guests WHERE event_id = ? AND lower(name) = lower(?)')
-      .get(ev.id, name);
+    const dup = db.prepare('SELECT 1 AS x FROM guests WHERE event_id = ? AND lower(name) = lower(?)').get(ev.id, name);
     if (dup) throw new HttpError(409, 'Ya hay un registro con ese nombre. Agrega tu apellido o una inicial.');
-    const b = computeQuote(p, sel);
+    const b = computeQuote(m, sel);
     const r = db
-      .prepare('INSERT INTO guests (event_id, name, subtotal, tip_share, honoree_share, total) VALUES (?,?,?,?,?,?)')
-      .run(ev.id, name, b.subtotal, b.tipShare, b.honoreeShare, b.total);
+      .prepare(
+        `INSERT INTO guests (event_id, name, subtotal, tip_share, honoree_share, total, calc_exact, rounding_diff)
+         VALUES (?,?,?,?,?,?,?,?)`
+      )
+      .run(ev.id, name, b.subtotal, b.tipShare, b.kind === 'v2' ? b.othersShare : b.honoreeShare, b.total, b.exact, b.roundingDiff);
     const gid = Number(r.lastInsertRowid);
     const ins = db.prepare('INSERT INTO guest_items (guest_id, item_id, qty) VALUES (?,?,?)');
     for (const [itemId, qty] of sel) ins.run(gid, itemId, qty);
@@ -433,53 +651,30 @@ route('POST', '/api/company/guests', ({ body }) => {
 
 const PAGES = {
   '/admin': 'admin.html',
+  '/admin/login': 'login.html',
   '/cumplimentado': 'cumplimentado.html',
   '/company': 'company.html',
 };
 const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
+  '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
 };
-
-function sha(s) {
-  return crypto.createHash('sha256').update(s).digest();
-}
-
-function isAdmin(req) {
-  if (!ADMIN_PIN) return true;
-  const h = req.headers.authorization || '';
-  if (!h.startsWith('Basic ')) return false;
-  const decoded = Buffer.from(h.slice(6), 'base64').toString('utf8');
-  const pass = decoded.slice(decoded.indexOf(':') + 1);
-  return crypto.timingSafeEqual(sha(pass), sha(ADMIN_PIN));
-}
-
-function deny(res) {
-  res.writeHead(401, {
-    'WWW-Authenticate': 'Basic realm="Administrador", charset="UTF-8"',
-    'Content-Type': 'application/json; charset=utf-8',
-  });
-  res.end(JSON.stringify({ error: 'Se requiere el PIN de administrador.' }));
-}
 
 function baseHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
-  res.setHeader(
-    'Content-Security-Policy',
-    "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
-  );
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  if (PROD) res.setHeader('Strict-Transport-Security', 'max-age=15552000');
 }
 
-function sendJson(res, status, data) {
+function sendJson(res, status, data, extra = {}) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(body),
+    ...extra,
   });
   res.end(body);
 }
@@ -509,14 +704,29 @@ function readJson(req) {
   });
 }
 
-async function handleApi(req, res, pathname) {
+async function handleApi(req, res, pathname, query) {
+  const ip = clientIp(req, TRUST_PROXY);
+  const isAdminPath = pathname.startsWith('/api/admin/');
+  const bucket = isAdminPath ? ['adm', 600] : req.method === 'GET' ? ['pubr', 240] : ['pubw', 40];
+  const lim = limiter.take(`${bucket[0]}:${ip}`, bucket[1], 60_000);
+  if (!lim.ok) throw Object.assign(new HttpError(429, 'Demasiadas solicitudes. Intenta de nuevo en un momento.'), { retry: lim.retry });
+
   for (const r of routes) {
     if (r.method !== req.method) continue;
     const m = r.re.exec(pathname);
     if (!m) continue;
-    if (r.admin && !isAdmin(req)) return deny(res);
+    if (r.admin) {
+      if (!auth.isAuthed(req)) throw new HttpError(401, 'Inicia sesión como administrador.');
+      const site = req.headers['sec-fetch-site'];
+      if (req.method !== 'GET' && site && site !== 'same-origin' && site !== 'none') throw new HttpError(403, 'Origen no permitido.');
+    }
     const body = req.method === 'GET' || req.method === 'DELETE' ? {} : await readJson(req);
-    return sendJson(res, 200, await r.handler({ body, params: m.slice(1) }));
+    const out = await r.handler({ req, res, body, query, ip, params: m.slice(1) });
+    if (out && out.raw) {
+      res.writeHead(out.status, { 'Cache-Control': 'no-store', ...out.headers });
+      return res.end(out.body);
+    }
+    return sendJson(res, 200, out);
   }
   const known = routes.some((r) => r.re.test(pathname));
   throw new HttpError(known ? 405 : 404, known ? 'Método no permitido.' : 'No encontrado.');
@@ -525,10 +735,7 @@ async function handleApi(req, res, pathname) {
 function serveFile(res, file, cache) {
   fs.readFile(file, (err, data) => {
     if (err) return sendJson(res, 404, { error: 'No encontrado.' });
-    res.writeHead(200, {
-      'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
-      'Cache-Control': cache,
-    });
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': cache });
     res.end(data);
   });
 }
@@ -536,18 +743,19 @@ function serveFile(res, file, cache) {
 function serveStatic(req, res, pathname) {
   if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'Método no permitido.' });
   if (pathname === '/') {
-    res.writeHead(302, { Location: '/company' });
+    res.writeHead(302, { Location: '/admin' });
     return res.end();
   }
   if (PAGES[pathname]) {
-    if (pathname === '/admin' && !isAdmin(req)) return deny(res);
+    if (pathname === '/admin' && !auth.isAuthed(req)) {
+      res.writeHead(302, { Location: '/admin/login' });
+      return res.end();
+    }
     return serveFile(res, path.join(PUBLIC_DIR, PAGES[pathname]), 'no-cache');
   }
   if (pathname.startsWith('/assets/')) {
     const file = path.normalize(path.join(PUBLIC_DIR, pathname));
-    if (!file.startsWith(path.join(PUBLIC_DIR, 'assets') + path.sep)) {
-      return sendJson(res, 404, { error: 'No encontrado.' });
-    }
+    if (!file.startsWith(path.join(PUBLIC_DIR, 'assets') + path.sep)) return sendJson(res, 404, { error: 'No encontrado.' });
     return serveFile(res, file, 'no-cache');
   }
   return sendJson(res, 404, { error: 'No encontrado.' });
@@ -556,29 +764,39 @@ function serveStatic(req, res, pathname) {
 const server = http.createServer(async (req, res) => {
   baseHeaders(res);
   try {
-    const { pathname: raw } = new URL(req.url, 'http://localhost');
-    const pathname = raw.length > 1 ? raw.replace(/\/+$/, '') : raw;
+    const url = new URL(req.url, 'http://localhost');
+    const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, '') : url.pathname;
     if (pathname === '/health') {
       if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'Método no permitido.' });
       db.prepare('SELECT 1').get();
       return sendJson(res, 200, { status: 'ok' });
     }
-    if (pathname.startsWith('/api/')) return await handleApi(req, res, pathname);
+    if (pathname.startsWith('/api/')) return await handleApi(req, res, pathname, url.searchParams);
     return serveStatic(req, res, pathname);
   } catch (err) {
-    if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
+    if (err instanceof HttpError) {
+      return sendJson(res, err.status, { error: err.message }, err.retry ? { 'Retry-After': String(err.retry) } : {});
+    }
     console.error(err);
     return sendJson(res, 500, { error: 'Error interno del servidor.' });
   }
 });
 
+const backups = backup.schedule(db, { dir: BACKUP_DIR, hours: BACKUP_HOURS, keep: BACKUP_KEEP });
+
 server.listen(PORT, HOST, () => {
-  console.log(`Cuenta compartida escuchando en http://localhost:${PORT}`);
-  console.log(`  Admin:          http://localhost:${PORT}/admin${ADMIN_PIN ? '  (protegido con ADMIN_PIN)' : ''}`);
-  console.log(`  Cumplimentado:  http://localhost:${PORT}/cumplimentado`);
-  console.log(`  Invitados:      http://localhost:${PORT}/company`);
+  console.log(`Come Along escuchando en http://localhost:${PORT} (${NODE_ENV})`);
+  console.log(`  Admin: /admin ${auth.enabled ? '(con contraseña)' : '(SIN contraseña: define ADMIN_PASSWORD)'}`);
+  console.log(`  Respaldos: ${BACKUP_HOURS > 0 ? `cada ${BACKUP_HOURS} h en ${BACKUP_DIR} (conserva ${BACKUP_KEEP})` : 'desactivados'}`);
 });
 
-// Railway envía SIGTERM durante los despliegues; cerrar la BD limpiamente.
-process.on('SIGTERM', () => server.close(() => { db.close(); process.exit(0); }));
-process.on('SIGINT', () => server.close(() => { db.close(); process.exit(0); }));
+function shutdown() {
+  if (backups) backups.stop();
+  server.close(() => {
+    db.close();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

@@ -194,3 +194,40 @@ td.num, th.num { text-align: right; }
 #toast.error { background: var(--danger); }
 
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* ------- v2: selector de cuenta, listas de nombres, impresión ------- */
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 14px 0 4px; }
+.toolbar .field { flex: 1 1 240px; }
+select {
+  width: 100%; min-height: 44px; padding: 8px 12px; font: inherit; color: var(--ink);
+  background: var(--surface); border: 1.5px solid var(--line); border-radius: 8px;
+}
+select:focus-visible { outline: 3px solid var(--gold); outline-offset: 2px; }
+.three { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 620px) { .three, .two { grid-template-columns: 1fr; } }
+.namelist { display: grid; gap: 8px; margin-top: 8px; }
+.namerow { display: grid; grid-template-columns: 1fr 44px; gap: 8px; }
+.namerow .x, .row .x { width: 44px; height: 44px; color: var(--danger); background: transparent; border: 1.5px solid var(--line); border-radius: 8px; font-size: 1.1rem; cursor: pointer; }
+.row { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) 90px 70px 44px; }
+.row .tipbox { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; font-weight: 600; margin: 0; }
+.row .tipbox input { width: 22px; height: 22px; }
+@media (max-width: 620px) { .row { grid-template-columns: 1fr 1fr 70px 44px; } .row .tipbox { grid-column: 1 / -1; } }
+.badge { display: inline-block; padding: 2px 8px; font-size: 0.78rem; font-weight: 700; border-radius: 999px; background: var(--line); }
+.badge.ok { background: #cfe9e5; color: var(--teal-dark); }
+.badge.warn { background: #f7e3ad; }
+.pill-note { margin: 10px 0 0; padding: 10px 12px; background: #f7e3ad55; border-left: 6px solid var(--gold); border-radius: 6px; font-size: 0.9rem; }
+.loginbox { max-width: 380px; margin: 48px auto 0; }
+.print-only { display: none; }
+@media print {
+  body { background: #fff; }
+  .top .where, .steps, .actions, .toolbar, .btn, #toast, .noprint, .linkrow button { display: none !important; }
+  .print-only { display: block; }
+  .tablewrap, .panel, .card { border-color: #999; break-inside: avoid; }
+  main { max-width: none; padding: 0; }
+}
+@media (max-width: 620px) { .row .x { order: 4; } .row .tipbox { order: 5; grid-column: 1 / -1; } }
+hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
+a.btn { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
+.row { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) 90px 104px 44px; }
+@media (max-width: 620px) { .row { grid-template-columns: 1fr 1fr 70px 44px; } }
+.badge { margin-left: 6px; }

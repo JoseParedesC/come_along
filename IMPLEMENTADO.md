@@ -1,58 +1,59 @@
-# Lo implementado (≈ 80 %)
+# Lo implementado (versión 0.9.0)
 
-Aplicación **monolito** en Node 22 + SQLite, sin dependencias externas.
+Monolito Node 22 + SQLite, sin dependencias externas. Esta entrega implementa lo que `FALTANTE.md` marcaba como
+pendiente **y que se puede resolver desde el código**; lo que depende de tu cuenta de Railway o de personas
+queda explícito en `FALTANTE.md`.
 
-## Rutas y reglas del flujo
+## 1. Reglas de negocio confirmadas (RN-01 … RN-04)
 
-| Ruta | Qué hace |
+| Regla | Implementación |
 |---|---|
-| `/admin` | Crea la cuenta: nombre, % de propina (10 % por defecto), ítems con valor unitario y cantidad. Vista previa de subtotal, propina y total. Botones **Guardar borrador** y **Guardar y habilitar al cumplimentado**. |
-| `/cumplimentado` | Solo disponible tras habilitar desde `/admin`. Lista ítems y cantidades **sin precios ni propina** (el API tampoco los envía). Al confirmar, habilita `/company`. |
-| `/company` | Solo disponible cuando el cumplimentado ya registró. El invitado ve precios y unidades disponibles, selecciona cantidades, pulsa **Ver total** (ticket con su consumo, su parte de la propina y su parte del consumo del cumplimentado), escribe su nombre y **guarda**. |
+| **RN-01** exentos, invitados, nº de pagadores | `/admin` registra el número de participantes que pagan y las listas de **exentos** e **invitados** (categorías distintas, fuera del divisor). Resumen explícito: pagadores, exentos, invitados y total de personas. Los exentos/invitados se registran en `/cumplimentado` (eligen su nombre; sin ver valores ni propina). |
+| **RN-02** propina manual | Ítem con casilla **Propina** (`items.is_tip`). Sin campo de porcentaje en cuentas nuevas (`tipPercent` ignorado). No se puede consumir ni asignar; se cuenta una sola vez. |
+| **RN-03** redondeo | `ceil(x/100)·100` aplicado **una vez** al total individual, en backend (aritmética entera) y en el ticket. Nunca se cuadra con la factura. Se guardan `calc_exact`, `total` (cobrado) y `rounding_diff`. |
+| **RN-04** reparto | `cuota = ceil((consumo + compartido / pagadores)/100)·100`, `compartido = propina + consumo de exentos + consumo de invitados`. Parte igual, no proporcional. El admin ve la diferencia por redondeo y «recaudo − factura». |
 
-Estados: `setup → honoree → open → closed`. El servidor bloquea cualquier acción fuera de su estado.
+Validaciones: cupos (no más registros que pagadores), cierre bloqueado con cuotas pendientes, cero pagadores/propina cero/consumos cero,
+ítems de propina no consumibles, nombres repetidos entre exentos e invitados.
 
-## Cálculo del total
+**Cuentas históricas**: la migración `user_version 1` es idempotente y no destructiva (copia automática previa `*.pre-v2-*.bak`).
+Las cuentas anteriores quedan con `rules_version = 1`, conservan el cálculo proporcional y los totales ya guardados, reciben tokens
+de enlace y su «cumplimentado» pasa a una persona exenta (se conserva `honoree_items`). No son editables.
 
-`total = c + c/Sg × T + c/Sg × H` (c = consumo del invitado, Sg = consumo de quienes pagan, T = propina, H = consumo del cumplimentado). Aritmética entera, redondeo al peso más cercano. Con todos los invitados registrados, lo recaudado = factura + propina (verificado en prueba: 121.000 = 110.000 + 11.000).
+## 2. Funcionalidad pendiente de la lista anterior
 
-## Persistencia (SQLite, `data/cuenta.db`)
+- **Editar ítems/cantidades después de habilitar** (`Editar ítems y pagadores`): fusiona por id, recalcula las cuotas guardadas y **rechaza** todo el cambio si alteraría la cuota de alguien ya pagado, si baja de lo ya tomado, si quita un ítem con consumos o si baja los pagadores por debajo de los registrados.
+- **Pagos y conciliación**: casilla «Pagado» por participante; tarjetas *Pagado* y *Por conciliar*.
+- **Exportar CSV** (UTF-8 con BOM, neutraliza inyección de fórmulas) y **vista de impresión / guardar PDF** (hoja `@media print`).
+- **Historial y varias cuentas simultáneas**: selector de cuentas en `/admin`; cada cuenta tiene su propio par de enlaces.
+- **Disponibilidad en vivo** en `/company` (sondeo cada 8 s; recorta la selección y avisa si otra persona tomó unidades).
 
-Tablas: `events`, `items`, `honoree_items`, `guests`, `guest_items`, con claves foráneas, `CHECK` de rangos e índices. Los totales de cada invitado se guardan como instantánea.
+## 3. Seguridad y operación
 
-## Integridad y seguridad
+- **Enlaces con token** aleatorio (144 bits) por cuenta y rol, con **regeneración** desde `/admin`. Sin token o con token inválido no se expone nada.
+- **Autenticación de admin** por sesión: cookie `HttpOnly` + `SameSite=Strict` (+ `Secure` en producción) firmada con HMAC, 12 h; bloqueo tras 8 fallos en 10 min; página `/admin/login`; comprobación `Sec-Fetch-Site` en escrituras; contraseña ≥ 10 caracteres obligatoria en producción (`ADMIN_PASSWORD`, alias `ADMIN_PIN`).
+- **Límite de peticiones** por IP con `Retry-After` (escrituras públicas 40/min, lecturas 240/min, admin 600/min); respeta `X-Forwarded-For` tras el proxy de Railway.
+- **Respaldos**: automáticos (`VACUUM INTO`, cada 6 h, conserva 14), descarga manual desde `/admin`, copia previa a migraciones y ensayo de restauración automatizado en las pruebas.
+- Se mantienen `GET /health`, `railway.json`, `.node-version`, escucha en `0.0.0.0`, cierre ordenado con SIGTERM y SQLite en volumen. HSTS en producción.
+- `scripts/verify-deploy.mjs`: verifica HTTPS, `/health`, cabeceras, rutas públicas, sesión y cookie `Secure` contra una URL desplegada.
 
-- El servidor recalcula totales siempre; valida enteros, rangos y unidades disponibles (descontando cumplimentado e invitados previos), dentro de transacciones `BEGIN IMMEDIATE`.
-- Nombre de invitado obligatorio y sin duplicados (sin distinguir mayúsculas).
-- `ADMIN_PIN` opcional protege `/admin` y `/api/admin/*` (HTTP Basic, comparación en tiempo constante).
-- CSP estricta (`default-src 'self'`), sin `innerHTML` (texto siempre como texto), límite de 1 MB por petición.
+## 4. Calidad
 
-## Administración
+| Prueba | Resultado en este entorno |
+|---|---|
+| `test/unit.mjs` — 10 unitarias (ejemplo de aceptación 37.400/42.400/32.400, 3.240→3.300, 10.000→10.000, cero pagadores, propiedad con 5.000 casos aleatorios) | ✅ 10/10 |
+| `test/migration.mjs` — BD v1 → v2 conserva datos, crea personas/tokens/copia previa, idempotente | ✅ 2/2 |
+| `test/smoke.mjs` — 25 pruebas de API sobre servidores reales (sesión, tokens, estados, secreto de precios/propina, RN-04, cupos, pagos, edición, CSV, rotación de enlaces, BD histórica, respaldo y restauración, límites, arranque en producción) | ✅ 25/25 |
+| `test/load.mjs` — 300 registros simultáneos por 100 unidades y 40 cupos | ✅ 100/100 unidades, 34/40 cupos, 0 sobreventas; p95 ≈ 640 ms |
+| `test/e2e.py` — recorrido completo en Chromium, móvil (390×844) y escritorio (1280×900), incluida disponibilidad en vivo y descarga de CSV | ✅ 2/2 |
 
-Resumen con subtotal, propina, total, consumo del cumplimentado, recaudado y por recaudar; tabla de ítems con disponibilidad; lista de invitados con desglose; eliminar un registro (libera sus ítems); volver a editar (antes de que el cumplimentado registre); cerrar el cobro; nueva cuenta; enlaces copiables.
+Se revisaron capturas de `/admin` (formulario y resumen) y del ticket móvil.
+`.github/workflows/ci.yml` ejecuta todo en GitHub Actions (aún **no ejecutado**: no hay acceso a GitHub desde aquí).
 
-## Verificación realizada
+## 5. Decisión deliberada
 
-- `npm test`: 15 comprobaciones de API, todas OK (bloqueos por estado, ausencia de precios/propina para el cumplimentado, matemática del reparto, disponibilidad, duplicados, cierre, PIN).
-- `python3 test/e2e.py`: recorrido completo en Chromium (viewport móvil 390×844), OK; sin errores de consola. Se revisaron capturas de `/company` y `/admin`.
+**Moneda con decimales: no se implementa.** Las reglas confirmadas fijan precios enteros en COP (RN-02) y redondeo a la centena (RN-03); admitir decimales las contradiría. Si más adelante se necesita otra moneda, habría que revisar RN-02/RN-03 primero.
 
+## 6. Cambios de documentación
 
-## Preparación Railway (2026-10-30)
-- `railway.json`: Railpack, comando de inicio, reinicio ante error y healthcheck.
-- `.node-version`: Node 22.
-- Servidor escucha en `0.0.0.0` (configurable mediante `HOST`) y utiliza `PORT`.
-- `GET /health`: comprueba disponibilidad del proceso y acceso a SQLite.
-- `ADMIN_PIN` obligatorio cuando `NODE_ENV=production` (fallo de arranque seguro).
-- Cierre ordenado del servidor y SQLite al recibir SIGTERM/SIGINT.
-- Documentación de volumen `/data`, variables y despliegue en Railway; `.env` excluido de Git.
-- Configuración entregada; **despliegue real en Railway no verificado**.
-
-## Documentación de cambios solicitados (2026-10-30)
-- Se agregó `REGLAS_NEGOCIO_ACTUALIZACION.md` con reglas RN-01 a RN-03, plan técnico, migración y criterios de aceptación.
-- Se actualizó `FALTANTE.md` para reflejar que los cambios de lógica **todavía no están implementados**.
-- El código de aplicación se mantiene sin cambios en esta entrega para no introducir un reparto incorrecto sin confirmar su política.
-
-
-## Aclaración de negocio (2026-10-30)
-
-Se confirmó y documentó el reparto definitivo en `REGLAS_NEGOCIO_ACTUALIZACION.md`: consumo individual + parte igual de propina manual y consumos de exentos e invitados, con redondeo a la centena superior. **Solo documentación; todavía NO implementado en el código.**
+`README.md` (reglas, seguridad, respaldos, restauración, Railway), `REGLAS_NEGOCIO_ACTUALIZACION.md` (estado + decisiones de implementación), `.env.example`, `package.json` 0.9.0 con scripts `test`, `test:unit`, `test:api`, `test:load`, `test:e2e`, `verify:deploy`.
