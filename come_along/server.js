@@ -12,6 +12,11 @@ const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 
 const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '0.0.0.0';
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT inválido');
+if (process.env.NODE_ENV === 'production' && !process.env.ADMIN_PIN) {
+  throw new Error('ADMIN_PIN es obligatorio en producción.');
+}
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'cuenta.db');
 const ADMIN_PIN = process.env.ADMIN_PIN || '';
 const CURRENCY = process.env.CURRENCY || 'COP';
@@ -553,6 +558,11 @@ const server = http.createServer(async (req, res) => {
   try {
     const { pathname: raw } = new URL(req.url, 'http://localhost');
     const pathname = raw.length > 1 ? raw.replace(/\/+$/, '') : raw;
+    if (pathname === '/health') {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'Método no permitido.' });
+      db.prepare('SELECT 1').get();
+      return sendJson(res, 200, { status: 'ok' });
+    }
     if (pathname.startsWith('/api/')) return await handleApi(req, res, pathname);
     return serveStatic(req, res, pathname);
   } catch (err) {
@@ -562,9 +572,13 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   console.log(`Cuenta compartida escuchando en http://localhost:${PORT}`);
   console.log(`  Admin:          http://localhost:${PORT}/admin${ADMIN_PIN ? '  (protegido con ADMIN_PIN)' : ''}`);
   console.log(`  Cumplimentado:  http://localhost:${PORT}/cumplimentado`);
   console.log(`  Invitados:      http://localhost:${PORT}/company`);
 });
+
+// Railway envía SIGTERM durante los despliegues; cerrar la BD limpiamente.
+process.on('SIGTERM', () => server.close(() => { db.close(); process.exit(0); }));
+process.on('SIGINT', () => server.close(() => { db.close(); process.exit(0); }));

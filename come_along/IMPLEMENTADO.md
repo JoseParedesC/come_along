@@ -35,3 +35,14 @@ Resumen con subtotal, propina, total, consumo del cumplimentado, recaudado y por
 
 - `npm test`: 15 comprobaciones de API, todas OK (bloqueos por estado, ausencia de precios/propina para el cumplimentado, matemática del reparto, disponibilidad, duplicados, cierre, PIN).
 - `python3 test/e2e.py`: recorrido completo en Chromium (viewport móvil 390×844), OK; sin errores de consola. Se revisaron capturas de `/company` y `/admin`.
+
+
+## Preparación Railway (2026-10-30)
+- `railway.json`: Railpack, comando de inicio, reinicio ante error y healthcheck.
+- `.node-version`: Node 22.
+- Servidor escucha en `0.0.0.0` (configurable mediante `HOST`) y utiliza `PORT`.
+- `GET /health`: comprueba disponibilidad del proceso y acceso a SQLite.
+- `ADMIN_PIN` obligatorio cuando `NODE_ENV=production` (fallo de arranque seguro).
+- Cierre ordenado del servidor y SQLite al recibir SIGTERM/SIGINT.
+- Documentación de volumen `/data`, variables y despliegue en Railway; `.env` excluido de Git.
+- Configuración entregada; **despliegue real en Railway no verificado**.

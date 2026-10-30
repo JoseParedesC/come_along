@@ -16,9 +16,18 @@
 ## Seguridad y operación
 - Enlaces con **token único** para `/cumplimentado` y `/company` (hoy cualquiera con la URL puede entrar) y autenticación de administrador más robusta que un PIN.
 - Límite de peticiones (rate limiting) y respaldo automático de la BD.
-- Dockerfile / guía de despliegue y HTTPS.
+- Despliegue real en Railway y comprobación del dominio HTTPS (la guía y configuración Railway ya están implementadas; Dockerfile no es necesario con Railpack).
 
 ## Calidad
 - Capturas y revisión en escritorio y otros navegadores (solo se revisó Chromium en viewport móvil).
 - Pruebas de accesibilidad con lector de pantalla y pruebas de carga/concurrencia.
 - Integrar `test/e2e.py` a una CI.
+
+
+## Pendiente de operación en Railway (2026-10-30)
+- Crear el servicio y conectar el repositorio GitHub.
+- Crear y montar el volumen persistente en `/data`; establecer `DB_PATH=/data/cuenta.db`.
+- Configurar un `ADMIN_PIN` secreto y `NODE_ENV=production`; asignar dominio público.
+- Verificar el healthcheck, las tres pantallas y la persistencia tras un redeploy.
+- Configurar backups externos y ensayar recuperación de SQLite; mantener una réplica.
+- Rate limiting, autenticación más robusta y tokens de acceso públicos continúan pendientes.

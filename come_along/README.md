@@ -39,3 +39,14 @@ El servidor recalcula siempre el total (nunca confía en el cliente) y valida un
 npm test             # API: 15 comprobaciones sobre un servidor real con BD temporal
 python3 test/e2e.py  # UI con Playwright (opcional; requiere playwright + chromium)
 ```
+
+## Despliegue en Railway
+
+1. Subir el contenido de **esta carpeta** a GitHub (si el repositorio conserva `come_along/` como subcarpeta, configurar **Root Directory** como `/come_along`).
+2. Crear servicio desde el repositorio. `railway.json` configura Railpack, `npm start` y healthcheck `/health`.
+3. Añadir un **Volume** con mount path `/data` al servicio **antes del primer despliegue con datos reales**.
+4. Variables del servicio: `NODE_ENV=production`, `DB_PATH=/data/cuenta.db`, `ADMIN_PIN=<secreto fuerte>`, `CURRENCY=COP`, `LOCALE=es-CO`. Railway inyecta `PORT`.
+5. Generar dominio en Networking y verificar `/health`, `/admin`, `/cumplimentado` y `/company`.
+6. Mantener **una sola réplica** mientras se use SQLite. Hacer backups periódicos del volumen; el volumen no equivale a un backup.
+
+**Advertencia:** en producción el servidor se niega a iniciar si falta `ADMIN_PIN`. Las rutas públicas `/cumplimentado` y `/company` siguen sin tokens de acceso. No se ha efectuado un despliegue real en una cuenta Railway.
