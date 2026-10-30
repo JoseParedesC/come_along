@@ -1,0 +1,12 @@
+{
+  "name": "cuenta-compartida",
+  "version": "0.8.0",
+  "description": "Monolito para dividir y cobrar una factura con cumplimentado, propina y consumo compartido.",
+  "private": true,
+  "license": "UNLICENSED",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/smoke.mjs"
+  }
+}
