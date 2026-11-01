@@ -870,7 +870,7 @@ const PAGES = {
 };
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.woff2': 'font/woff2',
 };
 
 function baseHeaders(res) {
@@ -969,7 +969,7 @@ function serveStatic(req, res, pathname) {
   if (pathname.startsWith('/assets/')) {
     const file = path.normalize(path.join(PUBLIC_DIR, pathname));
     if (!file.startsWith(path.join(PUBLIC_DIR, 'assets') + path.sep)) return sendJson(res, 404, { error: 'No encontrado.' });
-    return serveFile(res, file, 'no-cache');
+    return serveFile(res, file, file.endsWith('.woff2') ? 'public, max-age=31536000, immutable' : 'no-cache');
   }
   return sendJson(res, 404, { error: 'No encontrado.' });
 }

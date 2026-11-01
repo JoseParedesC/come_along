@@ -21,6 +21,13 @@ export const token = new URLSearchParams(location.search).get('t') || '';
 export const withToken = (path) => `${path}?t=${encodeURIComponent(token)}`;
 
 export const config = await api('/api/config');
+
+// Secuencia de entrada: solo durante la carga inicial; los re-renders posteriores no se animan.
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+if (!reducedMotion) {
+  document.documentElement.classList.add('is-entering');
+  setTimeout(() => document.documentElement.classList.remove('is-entering'), 1400);
+}
 const moneyFmt = new Intl.NumberFormat(config.locale, { style: 'currency', currency: config.currency, maximumFractionDigits: 0 });
 const pctFmt = new Intl.NumberFormat(config.locale, { maximumFractionDigits: 2 });
 export const money = (n) => moneyFmt.format(n);
@@ -62,8 +69,14 @@ export function stepper({ max, value = 0, label = 'Cantidad', onChange = () => {
   const minus = h('button', { type: 'button', class: 'step', 'aria-label': `Quitar uno: ${label}`, onClick: () => set(v - 1) }, '−');
   const plus = h('button', { type: 'button', class: 'step', 'aria-label': `Agregar uno: ${label}`, onClick: () => set(v + 1) }, '+');
   function set(n, silent = false) {
+    const prev = v;
     n = Number.isFinite(n) ? Math.trunc(n) : 0;
     v = Math.max(0, Math.min(cap, n));
+    if (!silent && v !== prev) {
+      input.classList.remove('bump');
+      void input.offsetWidth; // reinicia la animación
+      input.classList.add('bump');
+    }
     input.value = String(v);
     input.max = String(cap);
     minus.disabled = v <= 0;

@@ -4,7 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#f0f4f5">
   <title>Tu cuenta · Cuenta compartida</title>
+  <link rel="preload" href="/assets/fonts/bricolage.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/assets/fonts/instrument.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body class="narrow">
@@ -12,7 +15,7 @@
     <p class="brand">Cuenta compartida</p>
     <p class="where">Invitados</p>
   </header>
-  <main id="app"><p class="muted">Cargando…</p></main>
+  <main id="app"><div class="skeleton" role="status" aria-label="Cargando"><i></i><i></i><i></i></div></main>
   <div id="toast" role="status" aria-live="polite"></div>
   <script type="module" src="/assets/company.js"></script>
 </body>
