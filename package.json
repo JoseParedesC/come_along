@@ -1,14 +1,17 @@
 {
   "name": "cuenta-compartida",
-  "version": "1.0.0",
-  "description": "Monolito para dividir y cobrar una factura: consumo propio + parte igual de propina y de exentos/invitados.",
+  "version": "0.10.0",
+  "description": "Monolito para dividir y cobrar una factura (consumo propio + parte igual de propina y de exentos/invitados) y para cuentas cruzadas (quién le debe a quién).",
   "private": true,
   "license": "UNLICENSED",
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22.13" },
   "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "pg": "^8.13.1"
+    "start": "node server.js",
+    "test": "node --test test/unit.mjs test/settle.mjs test/migration.mjs && node test/smoke.mjs",
+    "test:unit": "node --test test/unit.mjs test/settle.mjs test/migration.mjs",
+    "test:api": "node test/smoke.mjs",
+    "test:load": "node test/load.mjs",
+    "test:e2e": "python3 test/e2e.py",
+    "verify:deploy": "node scripts/verify-deploy.mjs"
   }
 }

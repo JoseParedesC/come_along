@@ -1,10 +1,11 @@
-import { api, h, clear, money, pct, toast } from '/assets/common.js';
+import { api, h, clear, money, pct, toast, transfersTicket, balanceBadge } from '/assets/common.js';
 
 const root = document.getElementById('app');
 let events = [];
 let currentId = Number(new URLSearchParams(location.search).get('e')) || null;
 let creatingNew = false;
 let editing = false;
+let newKind = 'bill';
 
 const STEPS = [
   ['setup', 'Registrar la cuenta'],
@@ -13,10 +14,19 @@ const STEPS = [
   ['closed', 'Cerrada'],
 ];
 const STATUS_LABEL = { setup: 'Borrador', honoree: 'Esperando consumos', open: 'Cobrando', closed: 'Cerrada' };
+const CROSS_STEPS = [['setup', 'Registrar la cuenta'], ['open', 'Registro de gastos'], ['closed', 'Cerrada']];
+const statusLabel = (e) => (e.kind === 'cross' && e.status === 'open' ? 'Registrando gastos' : STATUS_LABEL[e.status]);
 
 /* ----------------------------------------------------------- Carga */
 
-const guard = (fn) => fn();
+async function guard(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err.status === 401) return void (location.href = '/admin/login');
+    throw err;
+  }
+}
 
 async function load(id = currentId) {
   await guard(async () => {
@@ -48,11 +58,18 @@ function render(s) {
   clear(root);
   root.append(toolbar());
   if (!s || creatingNew) {
-    root.append(stepsBar('setup'), h('h1', {}, 'Nueva cuenta'), formView(null, 'new'));
+    root.append(stepsBar('setup'), h('h1', {}, 'Nueva cuenta'), newAccountView());
     return;
   }
   const st = s.event.status;
-  root.append(stepsBar(st));
+  const kind = s.event.kind;
+  root.append(stepsBar(st, kind));
+  if (kind === 'cross') {
+    if (st === 'setup') root.append(h('h1', {}, 'Registrar la cuenta'), crossForm(s, 'setup'));
+    else if (editing && st !== 'closed') root.append(h('h1', {}, `Editar: ${s.event.name}`), crossForm(s, 'live'));
+    else root.append(crossSummary(s));
+    return;
+  }
   if (st === 'setup') root.append(h('h1', {}, 'Registrar la cuenta'), formView(s, 'setup'));
   else if (editing && st !== 'closed') root.append(h('h1', {}, `Editar: ${s.event.name}`), formView(s, 'live'));
   else root.append(summaryView(s));
@@ -64,16 +81,22 @@ function toolbar() {
     onChange: (e) => { creatingNew = false; editing = false; load(Number(e.target.value)); },
   }, events.map((e) =>
     h('option', { value: e.id, selected: e.id === currentId },
-      `${e.name} · ${STATUS_LABEL[e.status]} · ${String(e.createdAt).slice(0, 10)}`)));
+      `${e.name} · ${e.kind === 'cross' ? 'Cruzada' : 'Factura'} · ${statusLabel(e)} · ${String(e.createdAt).slice(0, 10)}`)));
   return h('div', { class: 'toolbar noprint' },
     events.length ? h('div', { class: 'field' }, h('label', { for: 'ev-select' }, 'Cuenta'), select) : null,
-    h('button', { type: 'button', class: 'btn ghost small', onClick: () => { creatingNew = true; editing = false; load(); } }, 'Nueva cuenta'));
+    h('button', { type: 'button', class: 'btn ghost small', onClick: () => { creatingNew = true; editing = false; load(); } }, 'Nueva cuenta'),
+    h('a', { class: 'btn ghost small', href: '/api/admin/backup', download: '' }, 'Descargar respaldo'),
+    h('button', {
+      type: 'button', class: 'btn ghost small',
+      onClick: async () => { await api('/api/admin/logout', { method: 'POST', body: {} }); location.href = '/admin/login'; },
+    }, 'Salir'));
 }
 
-function stepsBar(status) {
-  const idx = STEPS.findIndex(([k]) => k === status);
+function stepsBar(status, kind = 'bill') {
+  const steps = kind === 'cross' ? CROSS_STEPS : STEPS;
+  const idx = steps.findIndex(([k]) => k === status);
   return h('ol', { class: 'steps', 'aria-label': 'Estado de la cuenta' },
-    STEPS.map(([k, label], i) =>
+    steps.map(([k, label], i) =>
       h('li', { class: i < idx ? 'done' : i === idx ? 'now' : '', 'aria-current': i === idx ? 'step' : null }, label)));
 }
 
@@ -183,6 +206,7 @@ function formView(s, mode) {
       if (publish) await api(`/api/admin/events/${id}/publish`, { method: 'POST', body: {} });
       creatingNew = false;
       editing = false;
+      newKind = 'bill';
       currentId = id;
     }, publish ? 'Cuenta habilitada.' : live ? 'Cambios guardados y cuotas recalculadas.' : 'Borrador guardado.');
   }
@@ -362,6 +386,164 @@ function linkRow(label, path, note) {
         catch { toast('No se pudo copiar; selecciónalo manualmente.', true); }
       },
     }, 'Copiar'));
+}
+
+/* ------------------------------------------------- Cuentas cruzadas */
+
+function newAccountView() {
+  const kinds = [
+    ['bill', 'Factura con propina', 'Cada quien paga su consumo; exentos e invitados no pagan y la propina se reparte.'],
+    ['cross', 'Cuentas cruzadas', 'Cada quien registra lo que pagó; todo se suma, se divide en partes iguales y salen las deudas.'],
+  ];
+  return h('div', {},
+    h('div', { class: 'kindpick', role: 'radiogroup', 'aria-label': 'Tipo de cuenta' }, kinds.map(([k, title, desc]) =>
+      h('label', { class: `kind${newKind === k ? ' on' : ''}` },
+        h('input', { type: 'radio', name: 'kind', value: k, checked: newKind === k, onChange: () => { newKind = k; load(); } }),
+        h('strong', {}, title), h('span', { class: 'muted small' }, desc)))),
+    newKind === 'cross' ? crossForm(null, 'new') : formView(null, 'new'));
+}
+
+function crossForm(s, mode) {
+  const ev = s && s.event;
+  const live = mode === 'live';
+  const nameIn = h('input', { type: 'text', id: 'cx-name', maxLength: 80, value: ev ? ev.name : '', placeholder: 'Ej. Paseo a la playa' });
+  const nIn = h('input', { type: 'number', id: 'cx-n', min: 2, max: 500, step: 1, inputMode: 'numeric', value: ev ? String(ev.payersCount) : '' });
+
+  async function save(publish) {
+    const payersCount = Number(nIn.value);
+    if (!Number.isInteger(payersCount) || payersCount < 2) return toast('Indica cuántos participantes hay (mínimo 2).', true);
+    if (publish && !window.confirm('Al habilitar, los participantes podrán registrar sus gastos con el enlace. ¿Continuar?')) return;
+    const payload = { kind: 'cross', name: nameIn.value.trim() || 'Cuenta cruzada', payersCount };
+    await act(async () => {
+      let id = ev && ev.id;
+      if (mode === 'new') id = (await api('/api/admin/events', { method: 'POST', body: payload })).event.id;
+      else await api(`/api/admin/events/${id}`, { method: 'PUT', body: payload });
+      if (publish) await api(`/api/admin/events/${id}/publish`, { method: 'POST', body: {} });
+      creatingNew = false;
+      editing = false;
+      newKind = 'bill';
+      currentId = id;
+    }, publish ? 'Cuenta habilitada.' : live ? 'Cambios guardados.' : 'Borrador guardado.');
+  }
+
+  const cancel = creatingNew || live
+    ? h('button', { type: 'button', class: 'btn ghost', onClick: () => { creatingNew = false; editing = false; newKind = 'bill'; load(); } }, 'Cancelar')
+    : null;
+  return h('div', {},
+    h('div', { class: 'panel' },
+      h('div', { class: 'two' },
+        h('div', { class: 'field' }, h('label', { for: 'cx-name' }, 'Nombre de la cuenta'), nameIn),
+        h('div', { class: 'field' }, h('label', { for: 'cx-n' }, 'Número de participantes'), nIn)),
+      h('p', { class: 'muted small' }, 'Cada participante registra lo que pagó de su bolsillo. Se suma todo y se divide entre este número, incluso entre quienes no pagaron nada.')),
+    h('div', { class: 'actions' },
+      live
+        ? h('button', { type: 'button', class: 'btn grow', onClick: () => save(false) }, 'Guardar cambios')
+        : h('button', { type: 'button', class: 'btn grow', onClick: () => save(true) }, 'Guardar y habilitar'),
+      live ? null : h('button', { type: 'button', class: 'btn ghost', onClick: () => save(false) }, 'Guardar borrador'),
+      cancel));
+}
+
+function crossSummary(s) {
+  const { event: ev, cross: c } = s;
+  const closed = ev.status === 'closed';
+  const nodes = [h('h1', {}, ev.name), h('p', { class: 'print-only' }, `Cuenta cruzada del ${new Date().toLocaleDateString()} · ${statusLabel(ev)}`)];
+  nodes.push(h('p', { class: 'lead' }, closed
+    ? 'Cuenta cerrada: este es el resultado final.'
+    : c.complete ? 'Todos están registrados. Estos son los pagos para dejar las cuentas en cero.' : `Faltan ${c.pending} participante(s) por registrarse.`));
+
+  nodes.push(h('div', { class: 'cards' },
+    card('Total gastado', money(c.total)),
+    card('Participantes registrados', `${c.registered} / ${c.participants}`, !closed && !c.complete),
+    card('Parte por persona', money(Math.round(c.sharePerPerson)))));
+
+  if (!closed) {
+    nodes.push(
+      h('h2', { class: 'noprint' }, 'Enlace para los participantes'),
+      h('div', { class: 'links noprint' }, linkRow('Registrar gastos', ev.links.company, null)));
+  }
+
+  nodes.push(transfersTicket(c));
+
+  nodes.push(h('h2', {}, `Participantes (${c.registered} de ${c.participants})`));
+  nodes.push(c.members.length
+    ? h('div', { class: 'tablewrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, ['Nombre', 'Gastos', 'Pagó', 'Su parte', 'Saldo', ''].map((t, i) => h('th', { class: i > 1 && i < 4 ? 'num' : '' }, t)))),
+        h('tbody', {}, c.members.map((m) => h('tr', {},
+          h('td', {}, m.name),
+          h('td', {}, m.expenses.length
+            ? h('div', { class: 'chips' }, m.expenses.map((x) => h('span', { class: 'chip' }, `${x.description} ${money(x.amount)}`,
+                closed ? null : h('button', {
+                  type: 'button', class: 'noprint', 'aria-label': `Quitar gasto ${x.description} de ${m.name}`,
+                  onClick: () => { if (window.confirm(`¿Quitar "${x.description}" de ${m.name}?`)) act(() => api(`/api/admin/events/${ev.id}/expenses/${x.id}`, { method: 'DELETE' }), 'Gasto quitado.'); },
+                }, '×'))))
+            : h('span', { class: 'muted small' }, 'Sin gastos')),
+          h('td', { class: 'num' }, money(m.paid)),
+          h('td', { class: 'num' }, money(m.share)),
+          h('td', {}, balanceBadge(m.balance, !c.complete)),
+          h('td', {}, closed ? null : h('button', {
+            type: 'button', class: 'btn danger small noprint',
+            onClick: () => { if (window.confirm(`¿Eliminar a ${m.name} y sus gastos?`)) act(() => api(`/api/admin/events/${ev.id}/members/${m.id}`, { method: 'DELETE' }), 'Participante eliminado.'); },
+          }, 'Eliminar')))))))
+    : h('p', { class: 'muted' }, 'Todavía no hay participantes registrados.'));
+
+  if (!closed) nodes.push(crossAdminForms(ev, c));
+
+  const actions = [];
+  if (ev.status === 'open' && c.registered === 0) {
+    actions.push(h('button', { type: 'button', class: 'btn ghost', onClick: () => act(() => api(`/api/admin/events/${ev.id}/unpublish`, { method: 'POST', body: {} }), 'Volviste a borrador.') }, 'Volver a borrador'));
+  }
+  if (!closed) actions.push(h('button', { type: 'button', class: 'btn ghost', onClick: () => { editing = true; load(); } }, 'Editar nombre y participantes'));
+  actions.push(h('a', { class: 'btn ghost', href: `/api/admin/events/${ev.id}/export.csv`, download: '' }, 'Exportar CSV'));
+  actions.push(h('button', { type: 'button', class: 'btn ghost', onClick: () => window.print() }, 'Imprimir / guardar PDF'));
+  if (!closed) {
+    actions.push(h('button', {
+      type: 'button', class: 'btn danger',
+      onClick: () => { if (window.confirm('Al cerrar, nadie podrá registrar ni cambiar gastos. ¿Cerrar la cuenta?')) act(() => api(`/api/admin/events/${ev.id}/close`, { method: 'POST', body: {} }), 'Cuenta cerrada.'); },
+    }, 'Cerrar cuenta'));
+  }
+  nodes.push(h('div', { class: 'actions' }, actions));
+  return h('div', {}, nodes);
+}
+
+/** El administrador puede registrar participantes y gastos en nombre de otros. */
+function crossAdminForms(ev, c) {
+  const memberName = h('input', { type: 'text', id: 'adm-member', maxLength: 60, placeholder: 'Nombre' });
+  const addMember = h('button', {
+    type: 'button', class: 'btn ghost small',
+    onClick: () => {
+      const name = memberName.value.trim();
+      if (!name) return toast('Escribe el nombre.', true);
+      act(() => api(`/api/admin/events/${ev.id}/members`, { method: 'POST', body: { name } }), 'Participante agregado.');
+    },
+  }, 'Agregar participante');
+
+  const who = h('select', { id: 'adm-who' }, c.members.map((m) => h('option', { value: m.id }, m.name)));
+  const desc = h('input', { type: 'text', id: 'adm-desc', maxLength: 80, placeholder: 'Ej. Gasolina' });
+  const amount = h('input', { type: 'number', id: 'adm-amount', min: 1, step: 1, inputMode: 'numeric', placeholder: '0' });
+  const addExpense = h('button', {
+    type: 'button', class: 'btn small',
+    onClick: () => {
+      const n = Number(amount.value);
+      if (!who.value) return toast('Primero agrega un participante.', true);
+      if (!desc.value.trim()) return toast('Escribe qué se pagó.', true);
+      if (!Number.isInteger(n) || n < 1) return toast('El importe debe ser un entero mayor que 0.', true);
+      act(() => api(`/api/admin/events/${ev.id}/members/${who.value}/expenses`, { method: 'POST', body: { description: desc.value.trim(), amount: n } }), 'Gasto agregado.');
+    },
+  }, 'Agregar gasto');
+
+  return h('div', { class: 'noprint' },
+    h('h2', {}, 'Registrar en nombre de alguien'),
+    h('div', { class: 'panel' },
+      c.registered < c.participants
+        ? h('div', { class: 'addbar' },
+            h('div', { class: 'field' }, h('label', { for: 'adm-member' }, 'Nuevo participante'), memberName), addMember)
+        : h('p', { class: 'muted small' }, 'Ya están todos los participantes. Sube el número para agregar a alguien más.'),
+      c.members.length
+        ? h('div', { class: 'addbar' },
+            h('div', { class: 'field' }, h('label', { for: 'adm-who' }, 'Participante'), who),
+            h('div', { class: 'field' }, h('label', { for: 'adm-desc' }, 'Qué pagó'), desc),
+            h('div', { class: 'field' }, h('label', { for: 'adm-amount' }, 'Importe'), amount), addExpense)
+        : null));
 }
 
 load().catch((err) => {

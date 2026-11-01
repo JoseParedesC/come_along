@@ -53,7 +53,7 @@ Registrar por separado el importe calculado antes del redondeo, el importe cobra
 - Un importe ya múltiplo de 100 no aumenta.
 - No se modifica una cuota para igualar artificialmente el total de la factura.
 - Eventos existentes y sus registros sobreviven la migración.
-- Se mantienen la configuración Railway y `GET /health`. La base de datos es PostgreSQL (`DATABASE_URL`) y la aplicación no tiene autenticación de usuarios.
+- Se mantienen las configuraciones Railway, `GET /health`, `ADMIN_PIN` y SQLite persistente.
 
 ## Estado del código
 
@@ -93,3 +93,13 @@ Tres pagadores consumen 25.000, 30.000 y 20.000 COP; un exento consume 15.000, u
 - Evitar duplicación de propina y preservar cuentas históricas durante migración.
 
 **Estado:** implementado y verificado con las pruebas de este repositorio (ejemplo 37.400 / 42.400 / 32.400, recaudo 112.200, diferencia 200).
+
+## RN-05 — Cuentas cruzadas (0.10.0)
+
+- Cada participante registra lo que **pagó**; se suma todo y se divide **en partes iguales entre el número de participantes que ingresa el administrador** (N ≥ 2, incluye a quienes no pagaron nada).
+- `saldo = pagó − cuota`. Saldo positivo: le deben; negativo: debe. Los saldos suman cero.
+- Montos enteros, **sin redondeo a la centena** (RN-03 aplica solo a facturas): si `total = N·q + r`, los primeros `r` registrados asumen 1 peso más.
+- Los pagos («A le debe 5.000 a B») se calculan **solo cuando están registrados los N**; antes se muestran saldos provisionales.
+- Resolución: el mayor deudor paga al mayor acreedor hasta saldar; produce a lo sumo N − 1 pagos. No se rastrea quién compró qué para quién: solo sumas por persona.
+- No se puede cerrar con menos de N registrados (salvo cero, para cancelar); el admin puede ajustar N (≥ registrados).
+- Es un tipo de cuenta aparte (`events.kind = 'cross'`): no usa ítems, propina, exentos ni invitados.

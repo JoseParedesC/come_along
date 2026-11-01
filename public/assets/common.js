@@ -115,3 +115,36 @@ export function ticket(b, { title = 'Tu total' } = {}) {
     part('Tu parte de lo que consumió el cumplimentado', b.honoreeShare, `Su consumo se reparte y te corresponde el ${pct(b.sharePercent)}.`),
     total);
 }
+
+/* ------------------------------------------------ Cuentas cruzadas */
+
+/** «A le debe $5.000 a B» (solo cuando ya se registraron todos los participantes). */
+export function transfersTicket(c) {
+  const items = c.complete
+    ? c.transfers.length
+      ? c.transfers.map((t) =>
+          h('li', {}, h('strong', {}, t.from.name), ' le debe ', h('span', { class: 'amt' }, money(t.amount)), ' a ', h('strong', {}, t.to.name)))
+      : [h('li', {}, 'Las cuentas están al día: nadie le debe nada a nadie.')]
+    : [h('li', { class: 'wait' }, `Los pagos se calculan cuando se registren los ${c.participants} participantes (faltan ${c.pending}).`)];
+  return h('section', { class: 'ticket', 'aria-label': 'Quién le paga a quién' },
+    h('h2', {}, 'Quién le paga a quién'), h('ul', { class: 'xfers' }, items));
+}
+
+export function balanceBadge(balance, provisional) {
+  if (balance === 0) return h('span', { class: 'badge ok' }, 'Al día');
+  const txt = balance > 0 ? `Le deben ${money(balance)}` : `Debe ${money(-balance)}`;
+  return h('span', { class: `badge ${balance > 0 ? 'ok' : 'warn'}`, title: provisional ? 'Provisional: faltan participantes por registrar' : null }, provisional ? `${txt} *` : txt);
+}
+
+/** Lista de participantes con lo que pagó, su cuota y su saldo. */
+export function crossMembers(c) {
+  return h('div', { class: 'panel' },
+    h('ul', { class: 'list' }, c.members.map((m) =>
+      h('li', { class: 'item' },
+        h('div', {},
+          h('div', { class: 'name' }, m.name),
+          h('div', { class: 'meta' }, `Pagó ${money(m.paid)} · Su parte ${money(m.share)}`),
+          m.expenses.length ? h('div', { class: 'meta' }, m.expenses.map((x) => `${x.description} ${money(x.amount)}`).join(' · ')) : null),
+        balanceBadge(m.balance, !c.complete)))),
+    c.complete ? null : h('p', { class: 'muted small' }, '* Saldo provisional: cambia cuando se registren todos los participantes.'));
+}
